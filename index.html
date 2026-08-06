@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>icmptun — an IP tunnel disguised as an echo</title>
+<meta name="description" content="A point-to-point IP tunnel that disguises traffic as genuine ICMP echo request/reply packets, for paths that police every protocol except ping.">
+<style>
+  :root {
+    --bg: #0a0e14;
+    --bg-elevated: #10151d;
+    --bg-inset: #0d1219;
+    --border: #1e2530;
+    --border-soft: #171d27;
+    --text: #e6e9ef;
+    --text-dim: #8b93a3;
+    --text-faint: #5a6272;
+    --accent: #e8a34d;
+    --accent-dim: #b87f35;
+    --accent-glow: rgba(232, 163, 77, 0.35);
+    --good: #6fbf8b;
+    --mono: "JetBrains Mono", "Fira Code", ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  :root[data-theme="light"] {
+    --bg: #f7f5f0;
+    --bg-elevated: #ffffff;
+    --bg-inset: #f0ede6;
+    --border: #e2dfd8;
+    --border-soft: #ebe8e1;
+    --text: #1a1d24;
+    --text-dim: #5b6472;
+    --text-faint: #8a90a0;
+    --accent: #b8722a;
+    --accent-dim: #8f5a20;
+    --accent-glow: rgba(184, 114, 42, 0.18);
+    --good: #2f7a4f;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f7f5f0;
+      --bg-elevated: #ffffff;
+      --bg-inset: #f0ede6;
+      --border: #e2dfd8;
+      --border-soft: #ebe8e1;
+      --text: #1a1d24;
+      --text-dim: #5b6472;
+      --text-faint: #8a90a0;
+      --accent: #b8722a;
+      --accent-dim: #8f5a20;
+      --accent-glow: rgba(184, 114, 42, 0.18);
+      --good: #2f7a4f;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.6;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  code, pre, .mono { font-family: var(--mono); }
+
+  ::selection { background: var(--accent-glow); }
+
+  .wrap {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* ---------- top bar ---------- */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .topbar-inner {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 15px;
+    letter-spacing: -0.01em;
+    color: var(--text);
+  }
+  .brand:hover { text-decoration: none; }
+  .brand .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+    flex-shrink: 0;
+  }
+  .toplinks { display: flex; gap: 20px; font-size: 13.5px; font-family: var(--mono); }
+  .toplinks a { color: var(--text-dim); }
+  .toplinks a:hover { color: var(--accent); }
+
+  /* ---------- hero ---------- */
+  .hero {
+    padding: 76px 0 56px;
+    position: relative;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 22px;
+  }
+  .eyebrow .rule { width: 28px; height: 1px; background: var(--border); }
+
+  h1 {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(30px, 5.4vw, 46px);
+    line-height: 1.12;
+    letter-spacing: -0.02em;
+    margin: 0 0 22px;
+    text-wrap: balance;
+    max-width: 15ch;
+  }
+  h1 .accent { color: var(--accent); }
+
+  .lede {
+    font-size: 18px;
+    line-height: 1.65;
+    color: var(--text-dim);
+    max-width: 56ch;
+    margin: 0 0 36px;
+  }
+  .lede strong { color: var(--text); font-weight: 600; }
+
+  /* install block */
+  .install {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 1px 0 var(--border-soft);
+  }
+  .install-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--bg-inset);
+  }
+  .install-head span {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  .copy-btn {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    transition: border-color 150ms ease, color 150ms ease;
+  }
+  .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .install pre {
+    margin: 0;
+    padding: 18px 16px;
+    overflow-x: auto;
+    font-size: 13.5px;
+    line-height: 1.7;
+    color: var(--text);
+  }
+  .install pre .tok-cmd { color: var(--accent); }
+  .install pre .tok-dim { color: var(--text-faint); }
+
+  .install-note {
+    margin-top: 14px;
+    font-size: 13.5px;
+    color: var(--text-faint);
+  }
+  .install-note code { color: var(--text-dim); }
+
+  /* ---------- pulse visual ---------- */
+  .pulse-wrap {
+    margin-top: 48px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-elevated);
+    overflow: hidden;
+  }
+  .pulse-label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-soft);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+  }
+  .pulse-label .live {
+    display: flex; align-items: center; gap: 7px;
+    color: var(--good);
+  }
+  .pulse-label .live .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--good);
+    animation: blink 2.4s ease-in-out infinite;
+  }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+  canvas#pulse { display: block; width: 100%; height: 130px; }
+
+  /* ---------- sections ---------- */
+  section { padding: 64px 0; border-top: 1px solid var(--border-soft); }
+  section > .eyebrow { margin-bottom: 16px; }
+
+  h2 {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(22px, 3.4vw, 28px);
+    letter-spacing: -0.01em;
+    margin: 0 0 18px;
+    text-wrap: balance;
+  }
+
+  p { max-width: 68ch; color: var(--text-dim); }
+  p.lead { font-size: 16.5px; color: var(--text); }
+
+  .compare {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin: 28px 0 8px;
+  }
+  @media (max-width: 620px) { .compare { grid-template-columns: 1fr; } }
+  .compare-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 18px 20px;
+    background: var(--bg-elevated);
+  }
+  .compare-card h3 {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    margin: 0 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .compare-card.bad h3::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #c9694f; display:inline-block; }
+  .compare-card.good h3::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--good); display:inline-block; }
+  .trace {
+    height: 46px;
+    position: relative;
+    margin: 6px 0 14px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .trace svg { width: 100%; height: 100%; display: block; overflow: visible; }
+  .compare-card p { font-size: 13.5px; margin: 0; color: var(--text-dim); }
+
+  /* feature grid */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1px;
+    background: var(--border-soft);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-top: 24px;
+  }
+  @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
+  .cell {
+    background: var(--bg-elevated);
+    padding: 22px 22px 24px;
+  }
+  .cell .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 10px;
+    display: block;
+  }
+  .cell h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0 0 8px;
+    color: var(--text);
+  }
+  .cell p { font-size: 14px; margin: 0; color: var(--text-dim); max-width: 42ch; }
+
+  /* architecture */
+  .arch {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-elevated);
+    padding: 28px 20px;
+    margin: 28px 0;
+    overflow-x: auto;
+  }
+  .arch svg { display: block; margin: 0 auto; min-width: 560px; }
+  .arch-caption { text-align: center; font-family: var(--mono); font-size: 12px; color: var(--text-faint); margin-top: 4px; }
+
+  .steps { counter-reset: step; margin-top: 24px; display: flex; flex-direction: column; gap: 0; }
+  .step {
+    display: grid;
+    grid-template-columns: 40px 1fr;
+    gap: 16px;
+    padding: 18px 0;
+    border-top: 1px solid var(--border-soft);
+  }
+  .step:first-child { border-top: none; }
+  .step .num {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--accent);
+    padding-top: 2px;
+  }
+  .step h3 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+  .step p { font-size: 14px; margin: 0; }
+
+  /* usage / cli */
+  .cli {
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.9;
+    overflow-x: auto;
+    margin: 24px 0;
+  }
+  .cli .c1 { color: var(--accent); }
+  .cli .c2 { color: var(--text-faint); }
+  .cli .comment { color: var(--text-faint); }
+
+  footer {
+    border-top: 1px solid var(--border-soft);
+    padding: 40px 0 60px;
+  }
+  footer .foot-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 13px;
+    color: var(--text-faint);
+    font-family: var(--mono);
+  }
+  footer a { color: var(--text-dim); }
+  footer a:hover { color: var(--accent); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#top">
+      <span class="dot"></span>icmptun
+    </a>
+    <div class="toplinks">
+      <a href="#install">install</a>
+      <a href="#how">how it works</a>
+      <a href="https://github.com/Free-Guy-IR/icmptun">source</a>
+    </div>
+  </div>
+</div>
+
+<div class="wrap" id="top">
+
+  <section class="hero" style="border-top:none; padding-top:76px;">
+    <div class="eyebrow"><span class="rule"></span>ip tunnel · disguised as ping</div>
+    <h1>Every protocol gets<br>throttled. <span class="accent">Echo</span><br>doesn't.</h1>
+    <p class="lede">
+      <strong>icmptun</strong> carries ordinary IP traffic — TCP, UDP, anything —
+      wrapped inside genuine ICMP echo request/reply packets, for links where
+      everything else gets an initial burst through and then goes silent, but
+      a plain <code class="mono">ping</code> keeps working the whole time.
+    </p>
+
+    <div class="install" id="install">
+      <div class="install-head">
+        <span>install — run on each box</span>
+        <button class="copy-btn" onclick="copyInstall(this)">copy</button>
+      </div>
+      <pre id="install-cmd"><span class="tok-cmd">curl</span> -fsSL https://raw.githubusercontent.com/Free-Guy-IR/icmptun/main/install.sh -o /tmp/icmptun-install.sh <span class="tok-dim">&&</span> <span class="tok-cmd">sudo bash</span> /tmp/icmptun-install.sh</pre>
+    </div>
+    <p class="install-note">One command. Downloads the tool, drops you into the setup wizard. If <code>raw.githubusercontent.com</code> is itself filtered, add <code>--socks5 host:port</code> to the second command.</p>
+
+    <div class="pulse-wrap">
+      <div class="pulse-label">
+        <span>outer wire — what the path actually sees</span>
+        <span class="live"><span class="dot"></span>type 8 / type 0 only</span>
+      </div>
+      <canvas id="pulse" width="860" height="130"></canvas>
+    </div>
+  </section>
+
+  <section id="why">
+    <div class="eyebrow"><span class="rule"></span>the problem</div>
+    <h2>A burst gets through. Then nothing.</h2>
+    <p class="lead">
+      On some paths, TCP, UDP, GRE, and TLS relays all behave the same way:
+      a short initial burst of data goes through, then the connection goes
+      completely silent — no RST, no ICMP-unreachable, just gone. Bare ICMP
+      keeps passing under the exact same conditions.
+    </p>
+
+    <div class="compare">
+      <div class="compare-card bad">
+        <h3>tcp / udp / tls relay</h3>
+        <div class="trace">
+          <svg viewBox="0 0 300 46" preserveAspectRatio="none">
+            <line x1="0" y1="23" x2="300" y2="23" stroke="var(--border-soft)" stroke-width="1"/>
+            <path d="M0,23 L10,8 L20,32 L30,10 L40,30 L50,12 L60,23 L70,23 L80,23 L90,23 L100,23 L300,23"
+                  fill="none" stroke="#c9694f" stroke-width="1.6" opacity="0.9"/>
+          </svg>
+        </div>
+        <p>Burst of packets, then silence for the rest of the connection's life.</p>
+      </div>
+      <div class="compare-card good">
+        <h3>icmp echo</h3>
+        <div class="trace">
+          <svg viewBox="0 0 300 46" preserveAspectRatio="none">
+            <line x1="0" y1="23" x2="300" y2="23" stroke="var(--border-soft)" stroke-width="1"/>
+            <path d="M0,23 L8,6 L16,23 L40,23 L48,6 L56,23 L80,23 L88,6 L96,23 L120,23 L128,6 L136,23 L160,23 L168,6 L176,23 L200,23 L208,6 L216,23 L240,23 L248,6 L256,23 L280,23 L288,6 L296,23"
+                  fill="none" stroke="var(--good)" stroke-width="1.6"/>
+          </svg>
+        </div>
+        <p>Steady request/reply, indefinitely, at full volume.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="eyebrow"><span class="rule"></span>how it works</div>
+    <h2>Genuine echo semantics, not a raw shortcut</h2>
+    <p class="lead">Both ends run the same binary. The envelope is deliberately asymmetric, because some paths police ICMP by <em>direction</em> as well as protocol.</p>
+
+    <div class="steps">
+      <div class="step">
+        <div class="num">01</div>
+        <div>
+          <h3>Client always sends type 8</h3>
+          <p>A genuine Echo Request, addressed to the peer's real IP — indistinguishable on the wire from a normal <code class="mono">ping</code>.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">02</div>
+        <div>
+          <h3>Server always answers with type 0</h3>
+          <p>A real Echo Reply. Paths that permit "a reply to my own request" while treating an unsolicited inbound request as a fresh connection never see the difference.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">03</div>
+        <div>
+          <h3>Per-flow reordering restores order</h3>
+          <p>Each inner packet's own 5-tuple keys its own small reorder buffer, so one connection's reordering event can never delay an unrelated flow — including a bare health-check ping.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">04</div>
+        <div>
+          <h3>Plain IP underneath</h3>
+          <p>The payload is a full IP packet, so ordinary <code class="mono">iptables</code> DNAT port-forwarding works with zero protocol-specific code once the interface is up.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="arch">
+      <svg viewBox="0 0 640 190" width="100%" role="img" aria-label="Architecture: client TUN device to server TUN device via raw ICMP socket over the public internet">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+        <g font-family="var(--mono)" font-size="11" fill="var(--text-dim)">
+          <rect x="20" y="20" width="180" height="90" rx="8" fill="none" stroke="var(--border)"/>
+          <text x="110" y="42" text-anchor="middle" fill="var(--text)" font-weight="700">client box</text>
+          <rect x="40" y="56" width="140" height="24" rx="4" fill="var(--bg-inset)" stroke="var(--border-soft)"/>
+          <text x="110" y="72" text-anchor="middle">tun0</text>
+          <rect x="40" y="86" width="140" height="16" rx="3" fill="none"/>
+          <text x="110" y="98" text-anchor="middle" fill="var(--text-faint)">icmptun core</text>
+
+          <rect x="440" y="20" width="180" height="90" rx="8" fill="none" stroke="var(--border)"/>
+          <text x="530" y="42" text-anchor="middle" fill="var(--text)" font-weight="700">server box</text>
+          <rect x="460" y="56" width="140" height="24" rx="4" fill="var(--bg-inset)" stroke="var(--border-soft)"/>
+          <text x="530" y="72" text-anchor="middle">tun0</text>
+          <rect x="460" y="86" width="140" height="16" rx="3" fill="none"/>
+          <text x="530" y="98" text-anchor="middle" fill="var(--text-faint)">icmptun core</text>
+
+          <line x1="200" y1="55" x2="440" y2="55" stroke="var(--accent)" stroke-width="1.4" marker-end="url(#arrow)"/>
+          <text x="320" y="48" text-anchor="middle" fill="var(--accent)">echo request (type 8)</text>
+
+          <line x1="440" y1="80" x2="200" y2="80" stroke="var(--good)" stroke-width="1.4" marker-end="url(#arrow)"/>
+          <text x="320" y="95" text-anchor="middle" fill="var(--good)">echo reply (type 0)</text>
+
+          <text x="320" y="140" text-anchor="middle" fill="var(--text-faint)">raw ICMP socket · public internet</text>
+          <line x1="60" y1="150" x2="580" y2="150" stroke="var(--border-soft)" stroke-dasharray="2 4"/>
+        </g>
+      </svg>
+      <div class="arch-caption">plain IP packets in, genuine-looking ICMP out — either direction</div>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="eyebrow"><span class="rule"></span>capabilities</div>
+    <h2>Built for running it for real, not just a proof of concept</h2>
+    <div class="grid">
+      <div class="cell">
+        <span class="tag">self-contained</span>
+        <h3>Owns its own interface</h3>
+        <p>Brings the TUN device up and assigns its point-to-point address from inside the process — no external <code class="mono">ip addr</code>/<code class="mono">ip link</code> calls before or after starting it.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">reordering</span>
+        <h3>Per-flow, not shared</h3>
+        <p>Reordering on the underlying path is corrected per connection, keyed by each inner packet's real 5-tuple — one flow's hiccup can't delay another's.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">port forwarding</span>
+        <h3>TCP + UDP, together</h3>
+        <p>Add, remove, and list forwarded ports through a proper DNAT + MASQUERADE chain, fully isolated in its own custom iptables chains.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">safety</span>
+        <h3>Conflict detection</h3>
+        <p>Warns before adding a forward if another rule or a local listener already claims that port — the exact failure mode that once broke this silently.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">multi-instance</span>
+        <h3>More than one tunnel per box</h3>
+        <p>Several Iran-side servers into one foreign box, or the reverse — each instance gets its own config, binary, systemd unit, and chains.</p>
+      </div>
+      <div class="cell">
+        <span class="tag">operations</span>
+        <h3>systemd-native, no PID file</h3>
+        <p><code class="mono">Type=simple</code>; the binary is fully self-configuring, so systemd's own process tracking is always accurate.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="usage">
+    <div class="eyebrow"><span class="rule"></span>reference</div>
+    <h2>Usage</h2>
+    <p>Running with no arguments opens the interactive menu — the normal way to use it day to day. Every action is also a direct subcommand for scripting.</p>
+    <div class="cli"><span class="comment"># day to day</span>
+icmptun-ctl.sh                    <span class="comment"># interactive menu</span>
+icmptun-ctl.sh status             <span class="comment"># tunnel health, ping, active forwards</span>
+icmptun-ctl.sh pf add 8080 both   <span class="comment"># tcp+udp, defaults to the peer, same port</span>
+icmptun-ctl.sh pf del 8080 both
+icmptun-ctl.sh bbr on
+
+<span class="comment"># a second, independent tunnel on the same box</span>
+<span class="c1">ICMPTUN_INSTANCE</span>=second icmptun-ctl.sh init --role client -L &lt;ip&gt; -R &lt;ip&gt;
+<span class="c1">ICMPTUN_INSTANCE</span>=second icmptun-ctl.sh enable</div>
+    <p style="font-size:14px;">Full reference, architecture notes, and the source itself live in the <a href="https://github.com/Free-Guy-IR/icmptun">repository</a>.</p>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap foot-row">
+    <span>icmptun · MIT licensed</span>
+    <span><a href="https://github.com/Free-Guy-IR/icmptun">github.com/Free-Guy-IR/icmptun</a></span>
+  </div>
+</footer>
+
+<script>
+  function copyInstall(btn) {
+    var text = "curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/icmptun/main/install.sh -o /tmp/icmptun-install.sh && sudo bash /tmp/icmptun-install.sh";
+    navigator.clipboard.writeText(text).then(function () {
+      var orig = btn.textContent;
+      btn.textContent = "copied";
+      setTimeout(function () { btn.textContent = orig; }, 1400);
+    });
+  }
+
+  (function () {
+    var canvas = document.getElementById('pulse');
+    var ctx = canvas.getContext('2d');
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    function resize() {
+      var rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    function accentColor() {
+      var isLight = document.documentElement.getAttribute('data-theme') === 'light' ||
+        (!document.documentElement.getAttribute('data-theme') && window.matchMedia('(prefers-color-scheme: light)').matches);
+      return isLight ? '#b8722a' : '#e8a34d';
+    }
+    function gridColor() {
+      var isLight = document.documentElement.getAttribute('data-theme') === 'light' ||
+        (!document.documentElement.getAttribute('data-theme') && window.matchMedia('(prefers-color-scheme: light)').matches);
+      return isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.05)';
+    }
+
+    var t = 0;
+    function draw() {
+      var w = canvas.getBoundingClientRect().width;
+      var h = canvas.getBoundingClientRect().height;
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.strokeStyle = gridColor();
+      ctx.lineWidth = 1;
+      for (var gx = 0; gx < w; gx += 40) {
+        ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke();
+      }
+      var mid = h / 2;
+      ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke();
+
+      ctx.beginPath();
+      ctx.strokeStyle = accentColor();
+      ctx.lineWidth = 1.6;
+      var spacing = 64;
+      var pulseW = 26;
+      for (var x = -spacing; x < w + spacing; x += spacing) {
+        var px = x + (t % spacing);
+        var startX = px - pulseW / 2;
+        ctx.moveTo(startX, mid);
+        ctx.lineTo(startX + pulseW * 0.28, mid);
+        ctx.lineTo(startX + pulseW * 0.42, mid - h * 0.34);
+        ctx.lineTo(startX + pulseW * 0.58, mid + h * 0.34);
+        ctx.lineTo(startX + pulseW * 0.72, mid);
+        ctx.lineTo(startX + pulseW, mid);
+      }
+      ctx.stroke();
+
+      if (!reduced) {
+        t += 0.6;
+        requestAnimationFrame(draw);
+      }
+    }
+    draw();
+  })();
+</script>
+
+</body>
+</html>

@@ -22,7 +22,7 @@ SUFFIX=""
 CHAIN_SUFFIX=""
 if [[ -n "$INSTANCE" ]]; then
     if ! [[ "$INSTANCE" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        echo "نام instance فقط می‌تونه شامل حروف/عدد/خط‌تیره/زیرخط باشه: $INSTANCE"
+        echo "instance name may only contain letters/digits/hyphen/underscore: $INSTANCE"
         exit 1
     fi
     SUFFIX="-$INSTANCE"
@@ -44,11 +44,11 @@ FWD_CHAIN="ICMPTUN_FWD${CHAIN_SUFFIX}"
 # ---------------------------------------------------------------- helpers --
 
 need_root() {
-    [[ $EUID -eq 0 ]] || { echo "باید با root اجرا بشه (run as root)"; exit 1; }
+    [[ $EUID -eq 0 ]] || { echo "must be run as root"; exit 1; }
 }
 
 load_conf() {
-    [[ -f "$CONF_FILE" ]] || { echo "هنوز پیکربندی نشده."; exit 1; }
+    [[ -f "$CONF_FILE" ]] || { echo "not configured yet."; exit 1; }
     # shellcheck disable=SC1090
     source "$CONF_FILE"
 }
@@ -893,11 +893,11 @@ cmd_init() {
             -T) tun="$2"; shift 2 ;;
             -A) tun_local="$2"; shift 2 ;;
             -P) tun_peer="$2"; shift 2 ;;
-            *) echo "گزینه نامعتبر: $1"; exit 1 ;;
+            *) echo "invalid option: $1"; exit 1 ;;
         esac
     done
-    [[ "$role" == "client" || "$role" == "server" ]] || { echo "--role باید client یا server باشه"; exit 1; }
-    [[ -n "$local_ip" && -n "$peer_ip" ]] || { echo "هر دو -L و -R لازمه"; exit 1; }
+    [[ "$role" == "client" || "$role" == "server" ]] || { echo "--role must be client or server"; exit 1; }
+    [[ -n "$local_ip" && -n "$peer_ip" ]] || { echo "both -L and -R are required"; exit 1; }
 
     # -A/-P let you pick the tunnel's own point-to-point IPs explicitly -
     # required once more than one tunnel exists on the same box (e.g. one
@@ -924,9 +924,9 @@ TUN_PEER=$tun_peer
 EOF
     touch "$PF_FILE"
     write_source
-    echo "پیکربندی نوشته شد: $CONF_FILE"
+    echo "config written: $CONF_FILE"
     echo "role=$role local=$local_ip peer=$peer_ip tun=$tun_local<->$tun_peer"
-    echo "بعدی: از منو گزینه‌ی فعال‌سازی سرویس رو انتخاب کن"
+    echo "next: pick 'Enable auto-start' from the menu"
 }
 
 # ----------------------------------------------------------------- build ---
@@ -939,7 +939,7 @@ cmd_build() {
     # binary" is exactly how a stale build ships without anyone noticing.
     write_source
     gcc -O2 -Wall -o "$BIN" "$SRC_FILE"
-    echo "ساخته شد: $BIN"
+    echo "built: $BIN"
 }
 
 # ------------------------------------------------------------ nat scaffold -
@@ -1008,13 +1008,13 @@ cmd_start() {
     [[ -x "$BIN" ]] || cmd_build
 
     if _is_running; then
-        echo "از قبل در حال اجراست"
+        echo "already running"
         return 0
     fi
 
     if _systemd_owns_it; then
         systemctl start "$SERVICE_NAME"
-        echo "تانل استارت شد (از طریق systemd). role=$ROLE tun=$TUN_LOCAL<->$TUN_PEER"
+        echo "tunnel started (via systemd). role=$ROLE tun=$TUN_LOCAL<->$TUN_PEER"
         return 0
     fi
 
@@ -1030,7 +1030,7 @@ cmd_start() {
     sleep 1
 
     cmd_postup
-    echo "تانل استارت شد. role=$ROLE tun=$TUN_LOCAL<->$TUN_PEER"
+    echo "tunnel started. role=$ROLE tun=$TUN_LOCAL<->$TUN_PEER"
 }
 
 cmd_stop() {
@@ -1042,43 +1042,53 @@ cmd_stop() {
     pkill -f "$(_pgrep_pattern)" 2>/dev/null || true
     sleep 0.3
     [[ -n "${TUN_NAME:-}" ]] && ip link del "$TUN_NAME" 2>/dev/null || true
-    echo "تانل متوقف شد"
+    echo "tunnel stopped"
 }
 
 cmd_restart() { cmd_stop; sleep 1; cmd_start; }
 
 # ---------------------------------------------------------------- status ---
 
+_row() { printf "  %-16s %s\n" "$1" "$2"; }
+
 cmd_status() {
     load_conf
-    echo "=== ICMPTUN status ==="
-    echo "role=$ROLE local=$LOCAL_IP peer=$PEER_IP tun=$TUN_NAME ($TUN_LOCAL<->$TUN_PEER) ident=$IDENT mtu=$MTU"
-    [[ -n "$INSTANCE" ]] && echo "instance=$INSTANCE"
+    echo "┌─ tunnel ──────────────────────────────────────────────────"
+    _row "role"     "$ROLE$([ -n "$INSTANCE" ] && echo "  (instance: $INSTANCE)")"
+    _row "local"     "$LOCAL_IP"
+    _row "peer"      "$PEER_IP"
+    _row "interface" "$TUN_NAME  ($TUN_LOCAL <-> $TUN_PEER)"
+    _row "ident/mtu" "0x$IDENT / $MTU"
+
     local pid
     pid=$(pgrep -f "$(_pgrep_pattern)" | head -1)
     if [[ -n "$pid" ]]; then
-        echo "process: RUNNING (pid $pid)"
+        _row "process" "${C_GREEN}running${C_RESET} (pid $pid)"
     else
-        echo "process: STOPPED"
+        _row "process" "${C_RED}stopped${C_RESET}"
     fi
     if systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1; then
-        echo "systemd: enabled ($(systemctl is-active "$SERVICE_NAME" 2>/dev/null))"
+        _row "systemd" "enabled ($(systemctl is-active "$SERVICE_NAME" 2>/dev/null))"
     fi
+
     if ip link show "$TUN_NAME" >/dev/null 2>&1; then
-        echo "$TUN_NAME: UP"
+        _row "$TUN_NAME" "${C_GREEN}up${C_RESET}"
         if ping -c 3 -W 2 -i 0.3 "$TUN_PEER" >/tmp/.icmptun_ping.$$ 2>&1; then
             loss=$(grep -oP '\d+(?=% packet loss)' /tmp/.icmptun_ping.$$ || true)
             rtt=$(grep -oP 'rtt.*= \K[0-9.]+(?=/)' /tmp/.icmptun_ping.$$ || true)
-            echo "ping to peer ($TUN_PEER): loss=${loss}% rtt_min=${rtt}ms"
+            local loss_c="$C_GREEN"; [[ "${loss:-100}" != "0" ]] && loss_c="$C_YELLOW"
+            _row "ping to peer" "${loss_c}loss=${loss}%${C_RESET}  rtt=${rtt}ms"
         else
-            echo "ping to peer ($TUN_PEER): FAILED"
+            _row "ping to peer" "${C_RED}failed${C_RESET}"
         fi
         rm -f /tmp/.icmptun_ping.$$
     else
-        echo "$TUN_NAME: DOWN"
+        _row "$TUN_NAME" "${C_RED}down${C_RESET}"
     fi
-    echo "--- port forwards ---"
-    pf_list
+    echo "└───────────────────────────────────────────────────────────"
+    echo
+    echo "  port forwards:"
+    pf_list | sed 's/^/  /'
 }
 
 # Applied after the binary is confirmed up (tcp_reordering + NAT/port-
@@ -1129,7 +1139,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now "$SERVICE_NAME"
-    echo "systemd سرویس فعال شد: $SERVICE_NAME"
+    echo "systemd service enabled: $SERVICE_NAME"
 }
 
 cmd_logs() {
@@ -1146,7 +1156,7 @@ _pf_validate_proto() {
     case "$1" in
         tcp|udp) echo "$1" ;;
         both) echo "tcp udp" ;;
-        *) echo "پروتکل نامعتبر: $1 (باید tcp/udp/both باشه)" >&2; exit 1 ;;
+        *) echo "invalid protocol: $1 (must be tcp/udp/both)" >&2; exit 1 ;;
     esac
 }
 
@@ -1169,43 +1179,43 @@ _pf_check_conflicts() {
     hits=$(iptables-save -t nat 2>/dev/null | \
         grep -E "^-A (PREROUTING|OUTPUT) .*-p ${proto} .*--dport ${port}( |$)" || true)
     if [[ -n "$hits" ]]; then
-        echo "${C_YELLOW}هشدار: قانون DNAT دیگه‌ای از قبل رو پورت $port/$proto هست (خارج از زنجیره‌ی ما) - ممکنه ترافیک قبل از رسیدن به تانل اول اون رو بگیره:${C_RESET}"
+        echo "${C_YELLOW}warning: another DNAT rule already claims port $port/$proto (outside our chain) - it may catch traffic before it ever reaches the tunnel:${C_RESET}"
         echo "$hits" | sed 's/^/    /'
     fi
     if ss -H -"${proto:0:1}"ln 2>/dev/null | awk '{print $4}' | grep -qE ":${port}\$"; then
-        echo "${C_YELLOW}هشدار: یه پروسه‌ی محلی از قبل رو پورت $port ($proto) روی همین سرور گوش می‌ده${C_RESET}"
+        echo "${C_YELLOW}warning: a local process is already listening on port $port ($proto) on this box${C_RESET}"
     fi
 }
 
 cmd_pf_add() {
     need_root
     load_conf
-    local port="${1:?پورت لازمه}" proto="${2:?tcp/udp/both لازمه}"
+    local port="${1:?port required}" proto="${2:?tcp/udp/both required}"
     local tip="${3:-$TUN_PEER}" tport="${4:-$port}"
     local plist; plist=$(_pf_validate_proto "$proto")
 
     for p in $plist; do
         if grep -qE "^${port} ${p} " "$PF_FILE" 2>/dev/null; then
-            echo "قبلا وجود داره: $port/$p - رد شد"
+            echo "already exists: $port/$p - skipped"
             continue
         fi
         _pf_check_conflicts "$port" "$p"
         echo "$port $p $tip $tport" >> "$PF_FILE"
         _pf_dnat_rule -A "$p" "$port" "$tip" "$tport"
-        echo "اضافه شد: $port/$p -> $tip:$tport"
+        echo "added: $port/$p -> $tip:$tport"
     done
 }
 
 cmd_pf_del() {
     need_root
     load_conf
-    local port="${1:?پورت لازمه}" proto="${2:?tcp/udp/both لازمه}"
+    local port="${1:?port required}" proto="${2:?tcp/udp/both required}"
     local plist; plist=$(_pf_validate_proto "$proto")
 
     for p in $plist; do
         local line; line=$(grep -E "^${port} ${p} " "$PF_FILE" 2>/dev/null || true)
         if [[ -z "$line" ]]; then
-            echo "پیدا نشد: $port/$p"
+            echo "not found: $port/$p"
             continue
         fi
         local tip tport
@@ -1218,7 +1228,7 @@ cmd_pf_del() {
         # in the file while this function still reports success.
         grep -vE "^${port} ${p} " "$PF_FILE" > "$PF_FILE.tmp" || true
         mv "$PF_FILE.tmp" "$PF_FILE"
-        echo "حذف شد: $port/$p"
+        echo "removed: $port/$p"
     done
 }
 
@@ -1226,7 +1236,7 @@ cmd_pf_list() { pf_list; }
 
 pf_list() {
     load_conf 2>/dev/null || return 0
-    [[ -s "$PF_FILE" ]] || { echo "(هیچ پورت‌فورواردی تعریف نشده)"; return 0; }
+    [[ -s "$PF_FILE" ]] || { echo "(no port forwards defined)"; return 0; }
     printf "%-8s %-6s %-20s %-8s\n" "PORT" "PROTO" "TARGET" "TPORT"
     while read -r port proto tip tport; do
         [[ -z "$port" ]] && continue
@@ -1249,7 +1259,7 @@ cmd_pf_flush() {
     load_conf
     iptables -t nat -F "$DNAT_CHAIN" 2>/dev/null || true
     : > "$PF_FILE"
-    echo "همه‌ی پورت‌فورواردها پاک شدن"
+    echo "all port forwards cleared"
 }
 
 # ------------------------------------------------------------------ test ---
@@ -1259,11 +1269,11 @@ cmd_test() {
     echo "--- ping ---"
     ping -c 8 -i 0.3 -W 3 "$TUN_PEER" || true
     if command -v iperf3 >/dev/null 2>&1; then
-        echo "--- iperf3 (اگر سمت مقابل iperf3 -s در حال اجراست) ---"
+        echo "--- iperf3 (needs iperf3 -s running on the peer) ---"
         timeout 10 iperf3 -c "$TUN_PEER" -t 5 -B "$TUN_LOCAL" || \
-            echo "(iperf3 روی سمت مقابل در حال اجرا نیست - با iperf3 -s -D اجراش کن)"
+            echo "(iperf3 is not running on the peer - start it there with iperf3 -s -D)"
     else
-        echo "iperf3 نصب نیست، تست سرعت رد شد"
+        echo "iperf3 not installed, speed test skipped"
     fi
 }
 
@@ -1280,12 +1290,12 @@ cmd_bbr_status() {
     cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
     avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "?")
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
-    echo "الگوریتم فعلی: $cur   qdisc: $qdisc"
-    echo "الگوریتم‌های در دسترس کرنل: $avail"
+    echo "current algorithm: $cur   qdisc: $qdisc"
+    echo "kernel-available algorithms: $avail"
     if [[ "$cur" == "bbr" ]]; then
-        echo "وضعیت: ${C_GREEN}فعال${C_RESET}"
+        echo "status: ${C_GREEN}enabled${C_RESET}"
     else
-        echo "وضعیت: ${C_RED}غیرفعال${C_RESET}"
+        echo "status: ${C_RED}disabled${C_RESET}"
     fi
 }
 
@@ -1294,7 +1304,7 @@ cmd_bbr_enable() {
     modprobe tcp_bbr 2>/dev/null || true
     local avail; avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
     if [[ "$avail" != *bbr* ]]; then
-        echo "کرنل این سرور از BBR پشتیبانی نمی‌کنه (available: $avail)"
+        echo "this kernel doesn't support BBR (available: $avail)"
         return 1
     fi
     sysctl -w net.core.default_qdisc=fq >/dev/null
@@ -1304,14 +1314,14 @@ cmd_bbr_enable() {
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-    echo "BBR فعال شد و دائمی هم شد (اعمال میشه بعد از ریبوت هم)."
+    echo "BBR enabled and made persistent (survives reboot too)."
 }
 
 cmd_bbr_disable() {
     need_root
     sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null
     rm -f /etc/sysctl.d/99-icmptun-bbr.conf
-    echo "BBR غیرفعال شد، برگشت به cubic."
+    echo "BBR disabled, back to cubic."
 }
 
 # ------------------------------------------------- peer SSH (remote mgmt) --
@@ -1331,14 +1341,14 @@ load_peer_conf() {
 wizard_peer_conf() {
     load_conf
     header
-    echo "--- اطلاعات اتصال SSH به سرور مقابل ---"
-    echo "این اطلاعات فقط یک‌بار ذخیره می‌شه (فایل $PEER_CONF_FILE، فقط قابل خواندن توسط root) و دیگه لازم نیست دوباره وارد کنی."
+    echo "--- SSH connection details for the peer server ---"
+    echo "Saved once (file $PEER_CONF_FILE, root-readable only) - you won't need to enter it again."
     echo
-    read -rp "آی‌پی/هاست سرور مقابل [پیش‌فرض: $PEER_IP]: " h; h="${h:-$PEER_IP}"
-    read -rp "پورت SSH [22]: " prt; prt="${prt:-22}"
-    read -rp "یوزر [root]: " usr; usr="${usr:-root}"
-    read -rsp "پسورد: " pass; echo
-    read -rp "پروکسی SOCKS5 برای رسیدن به اون سرور (اختیاری، فرمت host:port - Enter برای رد کردن): " proxy
+    read -rp "Peer IP/host [default: $PEER_IP]: " h; h="${h:-$PEER_IP}"
+    read -rp "SSH port [22]: " prt; prt="${prt:-22}"
+    read -rp "User [root]: " usr; usr="${usr:-root}"
+    read -rsp "Password: " pass; echo
+    read -rp "SOCKS5 proxy to reach that server (optional, host:port format - Enter to skip): " proxy
     mkdir -p "$CONF_DIR"
     cat > "$PEER_CONF_FILE" <<EOF
 PEER_SSH_HOST=$h
@@ -1348,7 +1358,7 @@ PEER_SSH_PASS=$pass
 PEER_SSH_PROXY=$proxy
 EOF
     chmod 600 "$PEER_CONF_FILE"
-    echo "ذخیره شد."
+    echo "saved."
 }
 
 # Runs one command on the peer over SSH (password auth via a throwaway
@@ -1387,7 +1397,7 @@ EOF
 # regardless of any later remote step's outcome.
 cmd_remove_local() {
     need_root
-    load_conf 2>/dev/null || { echo "چیزی برای حذف نیست (پیکربندی نشده)"; return 0; }
+    load_conf 2>/dev/null || { echo "nothing to remove (not configured)"; return 0; }
 
     systemctl disable --now icmptun.service 2>/dev/null || true
     rm -f "$SERVICE_FILE"
@@ -1406,7 +1416,7 @@ cmd_remove_local() {
     iptables -t raw -D OUTPUT -p icmp --icmp-type echo-reply \
         -m u32 --u32 "24&0xFFFF0000=0x${hex}0000" -j DROP 2>/dev/null || true
 
-    echo "تانل از این سرور کامل حذف شد (کانفیگ نگه داشته شد، با 'start' دوباره بالا میاد)."
+    echo "tunnel fully removed from this box (config kept, 'start' brings it back)."
 }
 
 # Local removal always runs first and unconditionally; the remote attempt
@@ -1417,12 +1427,12 @@ cmd_remove_both() {
     cmd_remove_local
 
     echo
-    echo "در تلاش برای حذف تانل از سرور مقابل..."
+    echo "attempting to remove the tunnel from the peer server too..."
     if ! load_peer_conf; then
-        echo "اطلاعات اتصال به سرور مقابل ذخیره نشده."
-        read -rp "الان وارد کنم؟ (Y/n): " yn
+        echo "no saved connection details for the peer server."
+        read -rp "enter them now? (Y/n): " yn
         if [[ "${yn:-Y}" == "n" || "${yn:-Y}" == "N" ]]; then
-            echo "رد شد - سرور مقابل دستی نیاز به حذف داره."
+            echo "skipped - the peer will need manual removal."
             return 0
         fi
         wizard_peer_conf
@@ -1431,9 +1441,9 @@ cmd_remove_both() {
     local remote_cmd='systemctl disable --now icmptun.service 2>/dev/null; rm -f /etc/systemd/system/icmptun.service; systemctl daemon-reload 2>/dev/null; pkill -f "icmptun -L" 2>/dev/null; ip link del tun0 2>/dev/null; iptables -t nat -F ICMPTUN_DNAT 2>/dev/null; iptables -t nat -X ICMPTUN_DNAT 2>/dev/null; iptables -F ICMPTUN_FWD 2>/dev/null; iptables -X ICMPTUN_FWD 2>/dev/null; echo REMOTE_REMOVE_OK'
 
     if _peer_ssh "$remote_cmd"; then
-        echo "حذف از سرور مقابل هم موفق بود."
+        echo "removal from the peer server succeeded too."
     else
-        echo "اتصال SSH به سرور مقابل ناموفق شد - سرور محلی سالمه و کامل حذف شد، فقط سمت مقابل رو باید دستی حذف کنی."
+        echo "SSH to the peer server failed - this box is fully removed and healthy, but the peer needs manual removal."
     fi
 }
 
@@ -1442,71 +1452,78 @@ cmd_remove_both() {
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
 C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
 
-pause() { echo; read -rp "برای ادامه Enter بزن..." _ || true; }
+pause() { echo; read -rp "Press Enter to continue..." _ || true; }
 
 header() {
     clear
-    echo -e "${C_CYAN}${C_BOLD}============================================================${C_RESET}"
-    echo -e "${C_CYAN}${C_BOLD}   ICMPTUN - پنل مدیریت تانل${C_RESET}"
-    echo -e "${C_CYAN}${C_BOLD}============================================================${C_RESET}"
+    local title="ICMPTUN"
+    [[ -n "$INSTANCE" ]] && title="ICMPTUN [$INSTANCE]"
+    # Note: lines below deliberately don't close the box with a right-hand
+    # border - printf's field-width padding counts ANSI color bytes as
+    # visible characters, so a colored value inside a fixed-width field
+    # throws off the padding and misaligns a right border. Left-aligned,
+    # no right border, is the option that can't silently drift.
+    echo -e "${C_CYAN}${C_BOLD}╔══════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}║${C_RESET}  $title"
+    echo -e "${C_CYAN}${C_BOLD}╠══════════════════════════════════════════════════════════${C_RESET}"
     if [[ -f "$CONF_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$CONF_FILE"
         local proc_state tun_state
         if _is_running; then
-            proc_state="${C_GREEN}در حال اجرا${C_RESET}"
+            proc_state="${C_GREEN}●${C_RESET} running"
         else
-            proc_state="${C_RED}متوقف${C_RESET}"
+            proc_state="${C_RED}●${C_RESET} stopped"
         fi
         if ip link show "$TUN_NAME" >/dev/null 2>&1; then
-            tun_state="${C_GREEN}UP${C_RESET}"
+            tun_state="${C_GREEN}up${C_RESET}"
         else
-            tun_state="${C_RED}DOWN${C_RESET}"
+            tun_state="${C_RED}down${C_RESET}"
         fi
-        echo -e " نقش: ${C_YELLOW}$ROLE${C_RESET}   لوکال: $LOCAL_IP   سمت مقابل: $PEER_IP"
-        echo -e " پروسه: $proc_state   $TUN_NAME: $tun_state"
+        echo -e "${C_CYAN}${C_BOLD}║${C_RESET}  role: ${C_YELLOW}$ROLE${C_RESET}   local: $LOCAL_IP   peer: $PEER_IP"
+        echo -e "${C_CYAN}${C_BOLD}║${C_RESET}  process: $proc_state   $TUN_NAME: $tun_state"
     else
-        echo -e " ${C_RED}هنوز پیکربندی نشده${C_RESET}"
+        echo -e "${C_CYAN}${C_BOLD}║${C_RESET}  ${C_RED}not configured yet${C_RESET}"
     fi
-    echo -e "${C_CYAN}${C_BOLD}============================================================${C_RESET}"
+    echo -e "${C_CYAN}${C_BOLD}╚══════════════════════════════════════════════════════════${C_RESET}"
     echo
 }
 
 wizard_init() {
     header
-    echo "--- پیکربندی اولیه ---"
-    echo "این سرور نقشش چیه؟"
-    echo "  1) client  (سمت ایران - شروع‌کننده اتصال)"
-    echo "  2) server  (سمت خارج - پاسخ‌دهنده)"
-    read -rp "انتخاب: " rchoice
+    echo "--- Initial setup ---"
+    echo "What is this server's role?"
+    echo "  1) client  (initiates the connection)"
+    echo "  2) server  (answers - typically the box with the reachable public IP)"
+    read -rp "Choice: " rchoice
     local role=""
     case "$rchoice" in
         1) role=client ;;
         2) role=server ;;
-        *) echo "انتخاب نامعتبر"; pause; return 1 ;;
+        *) echo "invalid choice"; pause; return 1 ;;
     esac
-    read -rp "آی‌پی واقعی این سرور: " local_ip
-    read -rp "آی‌پی واقعی سرور مقابل: " peer_ip
+    read -rp "This server's real IP: " local_ip
+    read -rp "Peer server's real IP: " peer_ip
     if [[ -z "$local_ip" || -z "$peer_ip" ]]; then
-        echo "هر دو آی‌پی اجباری‌ان"; pause; return 1
+        echo "both IPs are required"; pause; return 1
     fi
-    read -rp "شناسه ICMP هگزادسیمال [پیش‌فرض 4d54]: " ident; ident="${ident:-4d54}"
-    read -rp "MTU [پیش‌فرض 1400]: " mtu; mtu="${mtu:-1400}"
+    read -rp "ICMP identifier, hex [default 4d54]: " ident; ident="${ident:-4d54}"
+    read -rp "MTU [default 1400]: " mtu; mtu="${mtu:-1400}"
 
     local def_local def_peer
     if [[ "$role" == "server" ]]; then def_local="10.99.0.2"; def_peer="10.99.0.1"
     else                               def_local="10.99.0.1"; def_peer="10.99.0.2"; fi
     echo
-    echo "آی‌پی داخلی تانل (فقط بین دو سرور تانل استفاده می‌شه، نه آی‌پی واقعی)."
-    echo "اگه این تنها تانلی هست که رو این سرور اجرا می‌شه، پیش‌فرض کافیه."
-    echo "اگه چند تا تانل هم‌زمان رو این سرور داری (مثلاً چند سرور ایران به یک خارج)، باید هر کدوم رنج جدا داشته باشن."
-    read -rp "آی‌پی تانل این سرور [پیش‌فرض $def_local]: " tun_local; tun_local="${tun_local:-$def_local}"
-    read -rp "آی‌پی تانل سمت مقابل [پیش‌فرض $def_peer]: " tun_peer; tun_peer="${tun_peer:-$def_peer}"
+    echo "Tunnel's internal IP (used only between the two tunnel ends, not a real IP)."
+    echo "If this is the only tunnel running on this box, the default is fine."
+    echo "If you're running several tunnels on this box at once (e.g. several Iran servers into one foreign box), each needs its own separate range."
+    read -rp "This end's tunnel IP [default $def_local]: " tun_local; tun_local="${tun_local:-$def_local}"
+    read -rp "Peer's tunnel IP [default $def_peer]: " tun_peer; tun_peer="${tun_peer:-$def_peer}"
 
     cmd_init --role "$role" -L "$local_ip" -R "$peer_ip" -I "$ident" -M "$mtu" -A "$tun_local" -P "$tun_peer"
     cmd_build
 
-    read -rp "الان استارت و فعال‌سازی سرویس systemd (اجرای خودکار) هم بشه؟ (Y/n): " yn
+    read -rp "Start and enable the systemd service (auto-start) now too? (Y/n): " yn
     if [[ "${yn:-Y}" != "n" && "${yn:-Y}" != "N" ]]; then
         cmd_enable
     fi
@@ -1516,10 +1533,10 @@ wizard_init() {
 declare -a PF_IDX_PORT PF_IDX_PROTO
 
 pf_list_numbered() {
-    load_conf 2>/dev/null || { echo "(پیکربندی نشده)"; return 0; }
+    load_conf 2>/dev/null || { echo "(not configured)"; return 0; }
     PF_IDX_PORT=(); PF_IDX_PROTO=()
     if [[ ! -s "$PF_FILE" ]]; then
-        echo "(هیچ پورت‌فورواردی تعریف نشده)"
+        echo "(no port forwards defined)"
         return 0
     fi
     printf "%-4s %-8s %-6s %-20s %-8s\n" "#" "PORT" "PROTO" "TARGET" "TPORT"
@@ -1534,28 +1551,28 @@ pf_list_numbered() {
 
 wizard_pf_add() {
     load_conf
-    read -rp "پورت عمومی: " port
-    if ! [[ "$port" =~ ^[0-9]+$ ]]; then echo "پورت نامعتبر"; return 1; fi
-    echo "پروتکل؟  1) tcp   2) udp   3) هردو با هم (tcp+udp)"
-    read -rp "انتخاب [3]: " pchoice
+    read -rp "Public port: " port
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then echo "invalid port"; return 1; fi
+    echo "Protocol?  1) tcp   2) udp   3) both together (tcp+udp)"
+    read -rp "Choice [3]: " pchoice
     local proto
     case "${pchoice:-3}" in
         1) proto=tcp ;;
         2) proto=udp ;;
         *) proto=both ;;
     esac
-    read -rp "آی‌پی مقصد [پیش‌فرض: سمت مقابل تانل - $TUN_PEER]: " tip; tip="${tip:-$TUN_PEER}"
-    read -rp "پورت مقصد [پیش‌فرض: همون $port]: " tport; tport="${tport:-$port}"
+    read -rp "Target IP [default: tunnel peer - $TUN_PEER]: " tip; tip="${tip:-$TUN_PEER}"
+    read -rp "Target port [default: same as $port]: " tport; tport="${tport:-$port}"
     cmd_pf_add "$port" "$proto" "$tip" "$tport"
 }
 
 wizard_pf_del() {
     pf_list_numbered
     [[ ${#PF_IDX_PORT[@]} -eq 0 ]] && return 0
-    read -rp "شماره ردیف برای حذف (0 = انصراف): " idx
+    read -rp "Row number to remove (0 = cancel): " idx
     [[ -z "$idx" || "$idx" == "0" ]] && return 0
     if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#PF_IDX_PORT[@]} )); then
-        echo "شماره نامعتبر"; return 1
+        echo "invalid number"; return 1
     fi
     cmd_pf_del "${PF_IDX_PORT[$((idx - 1))]}" "${PF_IDX_PROTO[$((idx - 1))]}"
 }
@@ -1563,25 +1580,25 @@ wizard_pf_del() {
 menu_portforward() {
     while true; do
         header
-        echo "--- مدیریت پورت‌فوروارد (TCP/UDP) ---"
+        echo -e "${C_DIM}── port forwarding (tcp/udp) ─────────────────────────────${C_RESET}"
         echo
         pf_list_numbered
         echo
-        cat <<'MENU'
-  1) افزودن پورت‌فوروارد جدید
-  2) حذف یک پورت‌فوروارد
-  3) پاک کردن همه
-  0) بازگشت به منوی اصلی
+        cat <<MENU
+  ${C_BOLD}1)${C_RESET} Add a port forward
+  ${C_BOLD}2)${C_RESET} Remove a port forward
+  ${C_BOLD}3)${C_RESET} Clear all
+  ${C_BOLD}0)${C_RESET} Back to main menu
 MENU
-        read -rp "انتخاب: " choice
+        read -rp "Choice: " choice
         case "$choice" in
             1) wizard_pf_add; pause ;;
             2) wizard_pf_del; pause ;;
-            3) read -rp "مطمئنی؟ همه‌ی پورت‌فورواردها پاک بشن؟ (y/N): " c
+            3) read -rp "Sure? This clears every port forward (y/N): " c
                [[ "$c" == "y" || "$c" == "Y" ]] && cmd_pf_flush
                pause ;;
             0) return 0 ;;
-            *) echo "انتخاب نامعتبر"; sleep 1 ;;
+            *) echo "invalid choice"; sleep 1 ;;
         esac
     done
 }
@@ -1589,21 +1606,25 @@ MENU
 menu_main() {
     while true; do
         header
-        cat <<'MENU'
-  1) وضعیت کامل تانل
-  2) استارت تانل
-  3) استاپ تانل
-  4) ری‌استارت تانل
-  5) مدیریت پورت‌فوروارد (افزودن/حذف/لیست)
-  6) تست پینگ و سرعت
-  7) فعال‌سازی اجرای خودکار (systemd)
-  8) حذف کامل تانل (این سرور + سرور مقابل)
-  9) تنظیم اطلاعات اتصال SSH به سرور مقابل
- 10) پیکربندی مجدد (Re-init)
- 11) فعال/غیرفعال‌سازی BBR (این سرور)
-  0) خروج
+        cat <<MENU
+  ${C_DIM}tunnel${C_RESET}
+   ${C_BOLD}1)${C_RESET} Status
+   ${C_BOLD}2)${C_RESET} Start
+   ${C_BOLD}3)${C_RESET} Stop
+   ${C_BOLD}4)${C_RESET} Restart
+   ${C_BOLD}5)${C_RESET} Port forwarding (add/remove/list)
+   ${C_BOLD}6)${C_RESET} Ping + speed test
+
+  ${C_DIM}system${C_RESET}
+   ${C_BOLD}7)${C_RESET} Enable auto-start (systemd)
+   ${C_BOLD}8)${C_RESET} Remove tunnel completely (this box + peer)
+   ${C_BOLD}9)${C_RESET} Set peer SSH connection details
+  ${C_BOLD}10)${C_RESET} Reconfigure (re-init)
+  ${C_BOLD}11)${C_RESET} Enable/disable BBR (this box)
+
+   ${C_BOLD}0)${C_RESET} Exit
 MENU
-        read -rp "انتخاب: " choice
+        read -rp "Choice: " choice
         case "$choice" in
             1) header; cmd_status; pause ;;
             2) header; cmd_start; pause ;;
@@ -1613,28 +1634,28 @@ MENU
             6) header; cmd_test; pause ;;
             7) header; cmd_enable; pause ;;
             8) header
-               read -rp "مطمئنی؟ تانل کامل از این سرور و سرور مقابل حذف می‌شه (y/N): " c
+               read -rp "Sure? This removes the tunnel completely from this box AND the peer (y/N): " c
                [[ "$c" == "y" || "$c" == "Y" ]] && cmd_remove_both
                pause ;;
             9) wizard_peer_conf; pause ;;
             10) wizard_init ;;
             11) menu_bbr ;;
-            0) echo "خداحافظ"; exit 0 ;;
-            *) echo "انتخاب نامعتبر"; sleep 1 ;;
+            0) echo "goodbye"; exit 0 ;;
+            *) echo "invalid choice"; sleep 1 ;;
         esac
     done
 }
 
 menu_bbr() {
     header
-    echo "--- BBR (کنترل ازدحام TCP) ---"
+    echo "--- BBR (TCP congestion control) ---"
     echo
     cmd_bbr_status
     echo
-    echo "  1) فعال کردن BBR"
-    echo "  2) غیرفعال کردن BBR (برگشت به cubic)"
-    echo "  0) بازگشت"
-    read -rp "انتخاب: " c
+    echo "  1) Enable BBR"
+    echo "  2) Disable BBR (back to cubic)"
+    echo "  0) Back"
+    read -rp "Choice: " c
     case "$c" in
         1) cmd_bbr_enable ;;
         2) cmd_bbr_disable ;;
@@ -1675,7 +1696,7 @@ main() {
                     del)   shift; cmd_pf_del "$@"; exit 0 ;;
                     list)  cmd_pf_list; exit 0 ;;
                     flush) cmd_pf_flush; exit 0 ;;
-                    *) echo "استفاده: $SCRIPT_PATH pf add|del|list|flush ..."; exit 1 ;;
+                    *) echo "usage: $SCRIPT_PATH pf add|del|list|flush ..."; exit 1 ;;
                 esac
                 ;;
             remove)
@@ -1688,8 +1709,8 @@ main() {
     fi
     if [[ ! -f "$CONF_FILE" ]]; then
         header
-        echo "به پنل مدیریت ICMPTUN خوش اومدی."
-        echo "هنوز پیکربندی نشده - اول باید تنظیمش کنیم."
+        echo "Welcome to the ICMPTUN management panel."
+        echo "Not configured yet - let's set it up first."
         pause
         wizard_init
     fi
