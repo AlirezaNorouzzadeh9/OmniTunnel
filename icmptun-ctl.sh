@@ -7,6 +7,7 @@
 # should expose a public port.
 set -euo pipefail
 
+VERSION="1.0.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
 # A box can run more than one independent tunnel at once (e.g. two Iran
@@ -1454,6 +1455,25 @@ C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
 
 pause() { echo; read -rp "Press Enter to continue..." _ || true; }
 
+# Shown once at startup, not on every menu redraw - a big banner on every
+# screen is a lot of scroll for something you glance at dozens of times a
+# session. header() below (the compact bordered panel) carries the status
+# summary on every subsequent screen instead.
+print_banner() {
+    clear
+    echo -e "${C_CYAN}${C_BOLD}"
+    cat <<'BANNER'
+ ___    ____   __  __   ____   _____   _   _   _   _
+|_ _|  / ___| |  \/  | |  _ \ |_   _| | | | | | \ | |
+ | |  | |    | |\/| | | |_) |   | |   | | | | |  \| |
+ | |  | |___ | |  | | |  __/    | |   | |_| | | |\  |
+|___|  \____| |_|  |_| |_|      |_|    \___/  |_| \_|
+BANNER
+    echo -e "${C_RESET}"
+    echo "  ICMP-Disguised IP Tunnel  -  by Free-Guy-IR  -  v${VERSION}"
+    echo
+}
+
 header() {
     clear
     local title="ICMPTUN"
@@ -1502,7 +1522,14 @@ wizard_init() {
         2) role=server ;;
         *) echo "invalid choice"; pause; return 1 ;;
     esac
-    read -rp "This server's real IP: " local_ip
+    local detected_ip
+    detected_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || true)
+    if [[ -n "$detected_ip" ]]; then
+        read -rp "This server's real IP [detected: $detected_ip]: " local_ip
+        local_ip="${local_ip:-$detected_ip}"
+    else
+        read -rp "This server's real IP: " local_ip
+    fi
     read -rp "Peer server's real IP: " peer_ip
     if [[ -z "$local_ip" || -z "$peer_ip" ]]; then
         echo "both IPs are required"; pause; return 1
@@ -1707,8 +1734,8 @@ main() {
                 ;;
         esac
     fi
+    print_banner
     if [[ ! -f "$CONF_FILE" ]]; then
-        header
         echo "Welcome to the ICMPTUN management panel."
         echo "Not configured yet - let's set it up first."
         pause
