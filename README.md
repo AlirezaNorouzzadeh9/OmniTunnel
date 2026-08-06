@@ -62,7 +62,74 @@ icmptun-ctl.sh pf add 8080 both      # tcp+udp, defaults to the tunnel's other e
 icmptun-ctl.sh pf add 443 tcp 10.0.0.5 8443   # or target a specific IP:port reachable from the far side
 ```
 
-## Usage
+## Guide
+
+### First-run setup wizard
+
+Running `icmptun-ctl.sh` with nothing configured yet walks you through these prompts:
+
+| Prompt | What to enter |
+|---|---|
+| Role? (1=client / 2=server) | The box with a real IP reachable from outside → **server**. The box that initiates the connection (typically the more restricted one) → **client**. |
+| This server's real IP | Auto-detected and pre-filled — just press Enter if it looks right. |
+| Peer server's real IP | The other box's real IP. |
+| ICMP identifier, hex [4d54] | Enter. Only change this if you're running more than one independent tunnel on the same box. |
+| MTU [1400] | Enter. |
+| Tunnel's internal IP (this end / peer) | Enter. Used only between the two tunnel ends, unrelated to the real IPs. Only needs to change if you're running several tunnels on the same box at once (each needs its own non-overlapping range). |
+| Start and enable the systemd service now? (Y/n) | Enter (yes) — makes it auto-start on boot and auto-restart if it ever crashes. |
+
+Do this on **both** boxes (one as `server`, one as `client`). Afterward, launch the panel anytime with:
+
+```bash
+icmptun-ctl.sh
+```
+
+### Main menu
+
+**tunnel**
+
+| Option | What it does |
+|---|---|
+| 1) Status | Full health check: process/interface state, ping to the peer, active port forwards. |
+| 2) Start | Brings the tunnel up (no-op if already running). |
+| 3) Stop | Takes the tunnel down. |
+| 4) Restart | Stop then start — useful after a change or to clear a stuck state. |
+| 5) Port forwarding | Opens the port-forwarding submenu (below). |
+| 6) Ping + speed test | Pings the peer; if `iperf3` is installed, also runs a throughput test (needs `iperf3 -s -D` running on the peer first). |
+
+**system**
+
+| Option | What it does | What it asks |
+|---|---|---|
+| 7) Enable auto-start | Installs/enables the systemd service — auto-starts on boot, auto-restarts on crash. | Nothing. |
+| 8) Remove tunnel completely | Tears the tunnel down on this box, then attempts the same on the peer over SSH. | Confirmation (y/N); if peer SSH details aren't saved yet (option 9), asks for them here. |
+| 9) Set peer SSH connection details | Saves the peer's SSH host/port/user/password once, so option 8 can reach it later without asking again. | IP/host, port, user, password, optional SOCKS5 proxy. |
+| 10) Reconfigure (re-init) | Re-runs the same prompts as first-run setup. | Same as the setup wizard above. |
+| 11) Enable/disable BBR | Opens the BBR submenu (below). | |
+| 0) Exit | Quits. | |
+
+### Port forwarding submenu (option 5)
+
+| Option | What it does | What it asks |
+|---|---|---|
+| 1) Add a port forward | Forwards a public port on this box, through the tunnel, to the peer side. | Public port → protocol (1=tcp, 2=udp, 3=both) → target IP (Enter = the tunnel peer itself) → target port (Enter = same port). |
+| 2) Remove a port forward | Removes one. | Shows a numbered list — enter the row number. |
+| 3) Clear all | Removes every forward. | Confirmation (y/N). |
+| 0) Back | Returns to the main menu. | |
+
+Add the port forward on whichever box real users actually connect to (usually the `client`), not necessarily the box running the real service.
+
+### BBR submenu (option 11)
+
+| Option | What it does |
+|---|---|
+| 1) Enable BBR | Switches TCP congestion control to BBR (usually better throughput on a path with occasional loss/reordering) — persists across reboots. |
+| 2) Disable BBR | Reverts to cubic (the Linux default). |
+| 0) Back | Returns to the main menu. |
+
+### Direct CLI commands
+
+Every menu action is also a direct subcommand, for quick one-off calls or scripting:
 
 ```
 icmptun-ctl.sh                 # interactive menu (status, start/stop, port forwards, BBR, ...)
