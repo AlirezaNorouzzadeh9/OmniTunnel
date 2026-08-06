@@ -18,31 +18,31 @@ CURL_OPTS=(-fsSL)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --socks5) CURL_OPTS+=(--socks5 "$2"); shift 2 ;;
-        *) echo "گزینه نامعتبر: $1"; exit 1 ;;
+        *) echo "invalid option: $1"; exit 1 ;;
     esac
 done
 
 if [[ $EUID -ne 0 ]]; then
-    echo "این اسکریپت باید با root اجرا بشه: sudo bash $0"
+    echo "this script must be run as root: sudo bash $0"
     exit 1
 fi
 
 if ! command -v gcc >/dev/null 2>&1; then
-    echo "gcc پیدا نشد - نصبش می‌کنم..."
+    echo "gcc not found - installing it..."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq && apt-get install -y -qq gcc iptables
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q gcc iptables
     else
-        echo "نمی‌دونم این توزیع چطور پکیج نصب می‌کنه - gcc رو خودت نصب کن و دوباره اجرا کن"
+        echo "don't know how to install packages on this distro - install gcc yourself and re-run"
         exit 1
     fi
 fi
 
-echo "در حال دانلود icmptun-ctl.sh ..."
+echo "downloading icmptun-ctl.sh ..."
 curl "${CURL_OPTS[@]}" "$RAW_URL" -o "$INSTALL_PATH"
 chmod +x "$INSTALL_PATH"
-echo "نصب شد: $INSTALL_PATH"
+echo "installed: $INSTALL_PATH"
 echo
 
 exec "$INSTALL_PATH"
