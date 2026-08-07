@@ -235,8 +235,17 @@ static int decapsulate(const unsigned char *buf, int len,
 #define FLOW_TABLE_BUCKETS  256   /* power of two */
 #define FLOW_TABLE_WAYS     4
 #define FLOW_TABLE_SIZE     (FLOW_TABLE_BUCKETS * FLOW_TABLE_WAYS)
-#define REORDER_WINDOW      32    /* power of two - per-flow reorder window */
-#define REORDER_TIMEOUT_MS  12    /* max wait for a missing packet in one flow */
+#define REORDER_WINDOW      256   /* power of two - per-flow reorder window.
+                                     Sized for the bandwidth-delay product of
+                                     a ~80ms path: 32 was far too small there
+                                     and forced retransmit storms (measured
+                                     1 Mbps vs 54 Mbps after widening). */
+#define REORDER_TIMEOUT_MS  45    /* max wait for a missing packet in one flow.
+                                     Must exceed one path RTT or the buffer
+                                     gives up on merely-late packets and the
+                                     inner TCP sees false loss. 12ms was tuned
+                                     for a shorter path and crushed throughput
+                                     on longer ones. */
 #define TIMER_HEAP_CAP      (FLOW_TABLE_SIZE * 4)
 
 #define FLOW_KEY_FRAG  0x01
@@ -882,7 +891,12 @@ EOF_ICMPTUN_C
 
 cmd_init() {
     need_root
-    local role="" local_ip="" peer_ip="" ident="4d54" mtu="1400" tun="tun0"
+    # Each instance needs its OWN tun device - two tunnels both on "tun0"
+    # would collide. Default the interface name to the instance name when
+    # one is set, so a caller that omits -T still gets a unique device.
+    local default_tun="tun0"
+    [[ -n "$INSTANCE" ]] && default_tun="tun-${INSTANCE}"
+    local role="" local_ip="" peer_ip="" ident="4d54" mtu="1400" tun="$default_tun"
     local tun_local="" tun_peer=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1269,12 +1283,37 @@ cmd_test() {
     load_conf
     echo "--- ping ---"
     ping -c 8 -i 0.3 -W 3 "$TUN_PEER" || true
-    if command -v iperf3 >/dev/null 2>&1; then
-        echo "--- iperf3 (needs iperf3 -s running on the peer) ---"
-        timeout 10 iperf3 -c "$TUN_PEER" -t 5 -B "$TUN_LOCAL" || \
-            echo "(iperf3 is not running on the peer - start it there with iperf3 -s -D)"
+
+    echo
+    echo "--- speed test ---"
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        echo "iperf3 is not installed on this box - speed test skipped."
+        echo "install it with: apt-get install -y iperf3"
+        return 0
+    fi
+
+    # Try to bring the peer's iperf3 server up ourselves rather than
+    # failing with a raw socket error the user then has to decode. Only
+    # possible when peer SSH details were saved (menu option 9).
+    if load_peer_conf 2>/dev/null; then
+        echo "starting iperf3 on the peer over SSH..."
+        _peer_ssh "command -v iperf3 >/dev/null 2>&1 || (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null 2>&1); pkill -x iperf3 2>/dev/null; setsid nohup iperf3 -s -1 -B $TUN_PEER >/dev/null 2>&1 < /dev/null & echo PEER_IPERF_UP" >/dev/null 2>&1 && sleep 2
+    fi
+
+    local out
+    out=$(timeout 15 iperf3 -c "$TUN_PEER" -t 5 -B "$TUN_LOCAL" 2>&1) || true
+    if echo "$out" | grep -q "sender"; then
+        echo "$out" | grep -E "sender|receiver"
     else
-        echo "iperf3 not installed, speed test skipped"
+        echo "could not run a speed test against the peer."
+        if load_peer_conf 2>/dev/null; then
+            echo "the peer was reachable over SSH but iperf3 did not accept the connection."
+            echo "check that the tunnel itself is up on both ends (menu option 1)."
+        else
+            echo "no peer SSH details saved, so the peer's iperf3 server could not be started"
+            echo "automatically. Either set them up (menu option 9), or run this on the peer:"
+            echo "    iperf3 -s -D -B $TUN_PEER"
+        fi
     fi
 }
 
@@ -1400,15 +1439,20 @@ cmd_remove_local() {
     need_root
     load_conf 2>/dev/null || { echo "nothing to remove (not configured)"; return 0; }
 
-    systemctl disable --now icmptun.service 2>/dev/null || true
+    systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
 
     cmd_stop 2>/dev/null || true
+    pkill -f "$BIN -L" 2>/dev/null || true
+    ip link del "$TUN_NAME" 2>/dev/null || true
 
-    iptables -t nat -F "$DNAT_CHAIN" 2>/dev/null || true
+    # Every rule this tool can create, removed in dependency order. The
+    # jump rules must go before the chains they point at can be deleted.
     iptables -t nat -D PREROUTING -j "$DNAT_CHAIN" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -o "$TUN_NAME" -j MASQUERADE 2>/dev/null || true
+    iptables -t nat -F "$DNAT_CHAIN" 2>/dev/null || true
     iptables -t nat -X "$DNAT_CHAIN" 2>/dev/null || true
     iptables -D FORWARD -j "$FWD_CHAIN" 2>/dev/null || true
     iptables -F "$FWD_CHAIN" 2>/dev/null || true
@@ -1417,7 +1461,17 @@ cmd_remove_local() {
     iptables -t raw -D OUTPUT -p icmp --icmp-type echo-reply \
         -m u32 --u32 "24&0xFFFF0000=0x${hex}0000" -j DROP 2>/dev/null || true
 
-    echo "tunnel fully removed from this box (config kept, 'start' brings it back)."
+    # Port-forward bookkeeping goes too - otherwise a later start would
+    # silently re-create forwards the user believes they just deleted.
+    rm -f "$PF_FILE"
+
+    if [[ "${1:-}" == "--purge" ]]; then
+        rm -rf "$CONF_DIR"
+        rm -f "$BIN" "$LOG_FILE"
+        echo "tunnel and ALL its config/binaries purged from this box."
+    else
+        echo "tunnel removed from this box (config kept, 'start' brings it back)."
+    fi
 }
 
 # Local removal always runs first and unconditionally; the remote attempt
@@ -1425,7 +1479,12 @@ cmd_remove_local() {
 # already-completed local result.
 cmd_remove_both() {
     need_root
-    cmd_remove_local
+    local purge="${1:-}"
+    local ident_hex tun_name
+    ident_hex=$(_ident_hex_upper "${IDENT:-4d54}" 2>/dev/null || echo 4D54)
+    tun_name="${TUN_NAME:-tun0}"
+
+    cmd_remove_local "$purge"
 
     echo
     echo "attempting to remove the tunnel from the peer server too..."
@@ -1439,7 +1498,34 @@ cmd_remove_both() {
         wizard_peer_conf
     fi
 
-    local remote_cmd='systemctl disable --now icmptun.service 2>/dev/null; rm -f /etc/systemd/system/icmptun.service; systemctl daemon-reload 2>/dev/null; pkill -f "icmptun -L" 2>/dev/null; ip link del tun0 2>/dev/null; iptables -t nat -F ICMPTUN_DNAT 2>/dev/null; iptables -t nat -X ICMPTUN_DNAT 2>/dev/null; iptables -F ICMPTUN_FWD 2>/dev/null; iptables -X ICMPTUN_FWD 2>/dev/null; echo REMOTE_REMOVE_OK'
+    # Mirror of cmd_remove_local, run on the peer. Kept in sync with it
+    # deliberately: an asymmetric teardown is what leaves a peer half-
+    # removed (service gone but chains/forwards still catching traffic).
+    local remote_cmd="
+systemctl disable --now icmptun.service 2>/dev/null
+rm -f /etc/systemd/system/icmptun.service
+systemctl daemon-reload 2>/dev/null
+systemctl reset-failed icmptun.service 2>/dev/null
+pkill -f 'icmptun -L' 2>/dev/null
+ip link del ${tun_name} 2>/dev/null
+iptables -t nat -D PREROUTING -j ICMPTUN_DNAT 2>/dev/null
+iptables -t nat -D POSTROUTING -o ${tun_name} -j MASQUERADE 2>/dev/null
+iptables -t nat -F ICMPTUN_DNAT 2>/dev/null
+iptables -t nat -X ICMPTUN_DNAT 2>/dev/null
+iptables -D FORWARD -j ICMPTUN_FWD 2>/dev/null
+iptables -F ICMPTUN_FWD 2>/dev/null
+iptables -X ICMPTUN_FWD 2>/dev/null
+iptables -t raw -D OUTPUT -p icmp --icmp-type echo-reply -m u32 --u32 '24&0xFFFF0000=0x${ident_hex}0000' -j DROP 2>/dev/null
+rm -f /etc/icmptun/portforwards
+"
+    if [[ "$purge" == "--purge" ]]; then
+        remote_cmd="$remote_cmd
+rm -rf /etc/icmptun
+rm -f /usr/local/bin/icmptun /usr/local/bin/icmptun-ctl.sh /var/log/icmptun.log
+"
+    fi
+    remote_cmd="$remote_cmd
+echo REMOTE_REMOVE_OK"
 
     if _peer_ssh "$remote_cmd"; then
         echo "removal from the peer server succeeded too."
@@ -1509,7 +1595,299 @@ header() {
     echo
 }
 
+# A wrong LOCAL_IP (e.g. pasting the *peer's* IP here) makes the binary
+# die at bind() with "Cannot assign requested address" and systemd then
+# restarts it forever, so the real mistake never surfaces to the user.
+# Catch it at config time, where it can still be explained.
+_ip_is_local() {
+    ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$1"
+}
+
+# Full clean reinstall driven entirely from this box: wipes both ends,
+# reconfigures this end, then pushes the matching config to the peer over
+# SSH so the two halves can't drift apart. Run this on the client (Iran)
+# side - it derives and applies the server side itself.
+cmd_reinstall_both() {
+    need_root
+    header
+    echo "--- Full reinstall (this box + peer) ---"
+    echo
+    echo "This wipes the existing tunnel from BOTH servers, then sets both up again"
+    echo "from scratch. Run it from the client (Iran) side."
+    echo
+    read -rp "Continue? (y/N): " c
+    [[ "$c" != "y" && "$c" != "Y" ]] && { echo "cancelled"; pause; return 0; }
+
+    if ! load_peer_conf 2>/dev/null; then
+        echo
+        echo "Peer SSH details are required so the peer can be reinstalled automatically."
+        wizard_peer_conf
+        load_peer_conf 2>/dev/null || { echo "no peer details - aborting."; pause; return 1; }
+    fi
+
+    echo
+    echo "checking SSH access to the peer first..."
+    if ! _peer_ssh "echo PEER_SSH_OK" 2>/dev/null | grep -q PEER_SSH_OK; then
+        echo "cannot reach the peer over SSH - fix that first (menu option 9)."
+        echo "nothing has been changed."
+        pause; return 1
+    fi
+    echo "peer SSH works."
+
+    echo
+    echo "[1/4] wiping the old tunnel from both boxes..."
+    cmd_remove_both --purge || true
+
+    echo
+    echo "[2/4] configuring this box..."
+    wizard_init_core || { echo "setup cancelled"; pause; return 1; }
+
+    echo
+    echo "[3/4] installing and configuring the peer..."
+    load_conf
+    _setup_remote_peer "$INSTANCE" "$PEER_IP" "$LOCAL_IP" "$IDENT" "$MTU" "$TUN_PEER" "$TUN_LOCAL" || true
+
+    echo
+    echo "[4/4] starting this box and verifying..."
+    cmd_enable
+    sleep 3
+    echo
+    if ping -c 4 -W 2 "$TUN_PEER" >/dev/null 2>&1; then
+        echo "${C_GREEN}tunnel is up on both ends.${C_RESET}"
+        ping -c 4 -W 2 "$TUN_PEER" | tail -2
+    else
+        echo "${C_YELLOW}tunnel is configured but not passing traffic yet - check status (option 1).${C_RESET}"
+    fi
+    pause
+}
+
+# ------------------------------------------------- multi-tunnel instances ---
+#
+# One box can hold any number of independent tunnels, each to a different
+# peer. They are kept apart by instance name, which drives a separate
+# config dir, binary, systemd unit, TUN device, ICMP identifier and
+# iptables chains - see the INSTANCE block at the top of this file.
+
+list_instances() {
+    local d found=0
+    for d in /etc/icmptun /etc/icmptun-*; do
+        [[ -f "$d/icmptun.conf" ]] || continue
+        found=1
+        local nm="(default)"
+        [[ "$d" != "/etc/icmptun" ]] && nm="${d#/etc/icmptun-}"
+        local sfx=""; [[ "$nm" != "(default)" ]] && sfx="-$nm"
+        local peer role state
+        peer=$(grep -E '^PEER_IP=' "$d/icmptun.conf" 2>/dev/null | cut -d= -f2)
+        role=$(grep -E '^ROLE=' "$d/icmptun.conf" 2>/dev/null | cut -d= -f2)
+        state="stopped"
+        pgrep -f "/usr/local/bin/icmptun${sfx} -L" >/dev/null 2>&1 && state="running"
+        printf "  %-14s peer=%-16s role=%-7s %s\n" "$nm" "$peer" "$role" "$state"
+    done
+    [[ $found -eq 0 ]] && echo "  (no tunnels configured on this box)"
+    return 0
+}
+
+# Pick an instance name, ICMP ident and tunnel subnet that don't collide
+# with anything already on THIS box.
+_next_free_instance() {
+    local n=2
+    while [[ -f "/etc/icmptun-t${n}/icmptun.conf" ]]; do n=$((n+1)); done
+    printf 't%s' "$n"
+}
+_next_free_ident() {
+    local base=$((0x4d54)) i=0 cand
+    while [[ $i -lt 200 ]]; do
+        cand=$(printf '%04x' $((base + i*2)))
+        if ! grep -rqs "^IDENT=$cand$" /etc/icmptun/icmptun.conf /etc/icmptun-*/icmptun.conf 2>/dev/null; then
+            printf '%s' "$cand"; return 0
+        fi
+        i=$((i+1))
+    done
+    printf '%s' "$(printf '%04x' $((RANDOM % 65535)))"
+}
+_next_free_subnet() {
+    local n=99
+    while grep -rqs "^TUN_LOCAL=10\.${n}\." /etc/icmptun/icmptun.conf /etc/icmptun-*/icmptun.conf 2>/dev/null; do
+        n=$((n+1)); [[ $n -gt 250 ]] && break
+    done
+    printf '10.%s.0' "$n"
+}
+
+# Add another tunnel from this box to a DIFFERENT peer, leaving every
+# existing tunnel (here and on the peer) untouched.
+wizard_add_tunnel() {
+    need_root
+    header
+    echo "--- Add another tunnel (to a different peer) ---"
+    echo
+    echo "Tunnels already on this box:"
+    list_instances
+    echo
+
+    local inst def_inst
+    def_inst=$(_next_free_instance)
+    read -rp "Name for the new tunnel [default $def_inst]: " inst
+    inst="${inst:-$def_inst}"
+    if ! [[ "$inst" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "name may only contain letters/digits/hyphen/underscore"; pause; return 1
+    fi
+    if [[ -f "/etc/icmptun-${inst}/icmptun.conf" ]]; then
+        echo "a tunnel named '$inst' already exists on this box"; pause; return 1
+    fi
+
+    local detected_ip local_ip peer_ip
+    detected_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || true)
+    read -rp "This server's real IP [detected: ${detected_ip:-none}]: " local_ip
+    local_ip="${local_ip:-$detected_ip}"
+    read -rp "New peer server's real IP: " peer_ip
+    [[ -z "$local_ip" || -z "$peer_ip" ]] && { echo "both IPs are required"; pause; return 1; }
+    if ! _ip_is_local "$local_ip"; then
+        echo "${C_RED}error: $local_ip is not an address on this machine.${C_RESET}"
+        ip -4 -o addr show 2>/dev/null | awk '{print "    " $2 "  " $4}' | grep -v ' lo '
+        pause; return 1
+    fi
+
+    local ident subnet mtu
+    ident=$(_next_free_ident)
+    subnet=$(_next_free_subnet)
+    mtu=1400
+    echo
+    echo "auto-picked non-conflicting settings for this box:"
+    echo "  instance : $inst"
+    echo "  ICMP id  : $ident"
+    echo "  tunnel   : ${subnet}.1 <-> ${subnet}.2"
+    echo
+
+    read -rp "Also install/configure the new peer automatically over SSH? (Y/n): " doremote
+    local want_remote=1
+    [[ "${doremote:-Y}" == "n" || "${doremote:-Y}" == "N" ]] && want_remote=0
+
+    # local half
+    ICMPTUN_INSTANCE="$inst" "$SCRIPT_PATH" init --role client \
+        -L "$local_ip" -R "$peer_ip" -I "$ident" -M "$mtu" \
+        -A "${subnet}.1" -P "${subnet}.2" || { echo "init failed"; pause; return 1; }
+    ICMPTUN_INSTANCE="$inst" "$SCRIPT_PATH" build || { echo "build failed"; pause; return 1; }
+
+    if [[ $want_remote -eq 1 ]]; then
+        echo
+        echo "--- new peer's SSH details ---"
+        local h prt usr pass proxy
+        read -rp "Peer SSH host [$peer_ip]: " h; h="${h:-$peer_ip}"
+        read -rp "Peer SSH port [22]: " prt; prt="${prt:-22}"
+        read -rp "Peer SSH user [root]: " usr; usr="${usr:-root}"
+        read -rsp "Peer SSH password: " pass; echo
+        read -rp "SOCKS5 proxy for SSH (host:port, blank for none): " proxy
+        mkdir -p "/etc/icmptun-${inst}"
+        cat > "/etc/icmptun-${inst}/peer_ssh.conf" <<EOF
+PEER_SSH_HOST=$h
+PEER_SSH_PORT=$prt
+PEER_SSH_USER=$usr
+PEER_SSH_PASS=$pass
+PEER_SSH_PROXY=$proxy
+EOF
+        chmod 600 "/etc/icmptun-${inst}/peer_ssh.conf"
+
+        PEER_SSH_HOST="$h" PEER_SSH_PORT="$prt" PEER_SSH_USER="$usr" \
+        PEER_SSH_PASS="$pass" PEER_SSH_PROXY="$proxy" \
+            _setup_remote_peer "$inst" "$peer_ip" "$local_ip" "$ident" "$mtu" "${subnet}.2" "${subnet}.1"
+    fi
+
+    ICMPTUN_INSTANCE="$inst" "$SCRIPT_PATH" enable || true
+    sleep 2
+    echo
+    if ping -c 4 -W 2 "${subnet}.2" >/dev/null 2>&1; then
+        echo "${C_GREEN}new tunnel '$inst' is up.${C_RESET}"
+    else
+        echo "${C_YELLOW}tunnel '$inst' configured but not passing traffic yet.${C_RESET}"
+    fi
+    echo
+    echo "manage it with:  ICMPTUN_INSTANCE=$inst $SCRIPT_PATH"
+    pause
+}
+
+# Install/configure the far end for a given instance. Critically: if that
+# box ALREADY runs a tunnel (very likely - a foreign box is often shared
+# by several Iran boxes), this never touches it. It picks a free instance
+# slot on the peer instead, so the existing tunnel and its port forwards
+# keep running untouched.
+_setup_remote_peer() {
+    local inst="$1" peer_ip="$2" our_ip="$3" ident="$4" mtu="$5" ptun_local="$6" ptun_peer="$7"
+
+    echo "checking what is already installed on the peer..."
+    local existing
+    existing=$(_peer_ssh 'ls -d /etc/icmptun /etc/icmptun-* 2>/dev/null | while read d; do [ -f "$d/icmptun.conf" ] && echo "$d"; done' 2>/dev/null | tr -d '\r')
+
+    local remote_inst=""
+    if [[ -n "$existing" ]]; then
+        echo "peer already has these tunnels - they will be left running:"
+        echo "$existing" | sed 's/^/    /'
+        # never reuse a slot that exists there
+        if echo "$existing" | grep -qx "/etc/icmptun"; then
+            local n=2
+            while echo "$existing" | grep -qx "/etc/icmptun-t${n}"; do n=$((n+1)); done
+            remote_inst="t${n}"
+        fi
+    fi
+    local remote_sfx="" remote_env=""
+    if [[ -n "$remote_inst" ]]; then
+        remote_sfx="-$remote_inst"
+        remote_env="ICMPTUN_INSTANCE=$remote_inst"
+        echo "using instance '$remote_inst' on the peer so nothing existing is disturbed."
+    else
+        echo "peer has no existing tunnel - using its default instance."
+    fi
+
+    local remote_setup="
+set -e
+command -v gcc >/dev/null 2>&1 || (DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc iptables >/dev/null 2>&1)
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/icmptun-ctl.sh <<'ICMPTUN_CTL_EOF'
+$(cat "$SCRIPT_PATH")
+ICMPTUN_CTL_EOF
+chmod +x /usr/local/bin/icmptun-ctl.sh
+$remote_env /usr/local/bin/icmptun-ctl.sh init --role server -L $peer_ip -R $our_ip -I $ident -M $mtu -A $ptun_local -P $ptun_peer
+$remote_env /usr/local/bin/icmptun-ctl.sh build
+$remote_env /usr/local/bin/icmptun-ctl.sh enable
+echo PEER_SETUP_OK
+"
+    if _peer_ssh "$remote_setup" 2>&1 | tail -25 | grep -q PEER_SETUP_OK; then
+        echo "peer configured and started."
+        return 0
+    fi
+    echo "peer setup did not report success - check it manually."
+    return 1
+}
+
+menu_instances() {
+    while true; do
+        header
+        echo "--- Tunnels on this box ---"
+        echo
+        list_instances
+        echo
+        echo "  ${C_BOLD}1)${C_RESET} Add another tunnel (to a different peer)"
+        echo "  ${C_BOLD}2)${C_RESET} Manage a different tunnel (switch instance)"
+        echo "  ${C_BOLD}0)${C_RESET} Back"
+        read -rp "Choice: " c
+        case "$c" in
+            1) wizard_add_tunnel ;;
+            2) read -rp "Instance name ((default) for the original): " nm
+               if [[ "$nm" == "(default)" || -z "$nm" ]]; then
+                   exec "$SCRIPT_PATH"
+               else
+                   exec env ICMPTUN_INSTANCE="$nm" "$SCRIPT_PATH"
+               fi ;;
+            0) return 0 ;;
+            *) echo "invalid choice"; sleep 1 ;;
+        esac
+    done
+}
+
 wizard_init() {
+    wizard_init_core && pause
+}
+
+wizard_init_core() {
     header
     echo "--- Initial setup ---"
     echo "What is this server's role?"
@@ -1547,6 +1925,17 @@ wizard_init() {
     read -rp "This end's tunnel IP [default $def_local]: " tun_local; tun_local="${tun_local:-$def_local}"
     read -rp "Peer's tunnel IP [default $def_peer]: " tun_peer; tun_peer="${tun_peer:-$def_peer}"
 
+    if ! _ip_is_local "$local_ip"; then
+        echo
+        echo "${C_RED}error: $local_ip is not an address on this machine.${C_RESET}"
+        echo "'This server's real IP' must be THIS box's own IP, not the peer's."
+        echo "addresses found on this box:"
+        ip -4 -o addr show 2>/dev/null | awk '{print "    " $2 "  " $4}' | grep -v ' lo '
+        echo
+        echo "nothing was changed."
+        return 1
+    fi
+
     cmd_init --role "$role" -L "$local_ip" -R "$peer_ip" -I "$ident" -M "$mtu" -A "$tun_local" -P "$tun_peer"
     cmd_build
 
@@ -1554,7 +1943,7 @@ wizard_init() {
     if [[ "${yn:-Y}" != "n" && "${yn:-Y}" != "N" ]]; then
         cmd_enable
     fi
-    pause
+    return 0
 }
 
 declare -a PF_IDX_PORT PF_IDX_PROTO
@@ -1644,10 +2033,12 @@ menu_main() {
 
   ${C_DIM}system${C_RESET}
    ${C_BOLD}7)${C_RESET} Enable auto-start (systemd)
-   ${C_BOLD}8)${C_RESET} Remove tunnel completely (this box + peer)
+   ${C_BOLD}8)${C_RESET} Remove tunnel (this box + peer)
    ${C_BOLD}9)${C_RESET} Set peer SSH connection details
-  ${C_BOLD}10)${C_RESET} Reconfigure (re-init)
-  ${C_BOLD}11)${C_RESET} Enable/disable BBR (this box)
+  ${C_BOLD}10)${C_RESET} Reconfigure this tunnel (re-init)
+  ${C_BOLD}11)${C_RESET} Full reinstall - wipe & set up BOTH boxes
+  ${C_BOLD}12)${C_RESET} Multiple tunnels (add / switch)
+  ${C_BOLD}13)${C_RESET} Enable/disable BBR (this box)
 
    ${C_BOLD}0)${C_RESET} Exit
 MENU
@@ -1661,12 +2052,24 @@ MENU
             6) header; cmd_test; pause ;;
             7) header; cmd_enable; pause ;;
             8) header
-               read -rp "Sure? This removes the tunnel completely from this box AND the peer (y/N): " c
-               [[ "$c" == "y" || "$c" == "Y" ]] && cmd_remove_both
+               echo "Remove the tunnel from this box AND the peer."
+               echo
+               echo "  1) Remove tunnel + all its rules/forwards (keep config, can 'start' again)"
+               echo "  2) PURGE - also delete config, binaries and saved settings"
+               echo "  0) Cancel"
+               read -rp "Choice: " rc
+               case "$rc" in
+                   1) read -rp "Sure? (y/N): " c
+                      [[ "$c" == "y" || "$c" == "Y" ]] && cmd_remove_both ;;
+                   2) read -rp "Sure? This deletes EVERYTHING on both boxes (y/N): " c
+                      [[ "$c" == "y" || "$c" == "Y" ]] && cmd_remove_both --purge ;;
+               esac
                pause ;;
             9) wizard_peer_conf; pause ;;
             10) wizard_init ;;
-            11) menu_bbr ;;
+            11) cmd_reinstall_both ;;
+            12) menu_instances ;;
+            13) menu_bbr ;;
             0) echo "goodbye"; exit 0 ;;
             *) echo "invalid choice"; sleep 1 ;;
         esac
@@ -1700,6 +2103,7 @@ main() {
     need_root
     if [[ $# -gt 0 ]]; then
         case "$1" in
+            init)     shift; cmd_init "$@"; exit 0 ;;
             start)    cmd_start; exit 0 ;;
             stop)     cmd_stop; exit 0 ;;
             restart)  cmd_restart; exit 0 ;;
@@ -1728,10 +2132,12 @@ main() {
                 ;;
             remove)
                 case "${2:-}" in
-                    both)  cmd_remove_both; exit 0 ;;
+                    both)  cmd_remove_both "${3:-}"; exit 0 ;;
+                    purge) cmd_remove_local --purge; exit 0 ;;
                     *)     cmd_remove_local; exit 0 ;;
                 esac
                 ;;
+            instances) list_instances; exit 0 ;;
         esac
     fi
     print_banner

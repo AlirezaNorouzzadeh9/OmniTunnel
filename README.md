@@ -102,10 +102,12 @@ icmptun-ctl.sh
 | Option | What it does | What it asks |
 |---|---|---|
 | 7) Enable auto-start | Installs/enables the systemd service — auto-starts on boot, auto-restarts on crash. | Nothing. |
-| 8) Remove tunnel completely | Tears the tunnel down on this box, then attempts the same on the peer over SSH. | Confirmation (y/N); if peer SSH details aren't saved yet (option 9), asks for them here. |
-| 9) Set peer SSH connection details | Saves the peer's SSH host/port/user/password once, so option 8 can reach it later without asking again. | IP/host, port, user, password, optional SOCKS5 proxy. |
-| 10) Reconfigure (re-init) | Re-runs the same prompts as first-run setup. | Same as the setup wizard above. |
-| 11) Enable/disable BBR | Opens the BBR submenu (below). | |
+| 8) Remove tunnel | Two levels: **remove** (tears the tunnel + every iptables rule and port forward off this box and the peer, but keeps config so `start` can bring it back), or **purge** (also deletes config, binaries and saved settings on both boxes). Both are symmetric — nothing is left half-removed on either side. | Which level, then confirmation (y/N). Uses saved peer SSH details (option 9); asks for them if not saved. |
+| 9) Set peer SSH connection details | Saves the peer's SSH host/port/user/password once, so options 8 and 11 can reach it later without asking again. | IP/host, port, user, password, optional SOCKS5 proxy. |
+| 10) Reconfigure (re-init) | Re-runs the setup prompts for this tunnel. Validates that the IP you give as "this server's IP" actually belongs to this machine — catches the common mistake of pasting the peer's IP, which otherwise makes the tunnel fail silently and restart forever. | Same as the setup wizard above. |
+| 11) Full reinstall — wipe & set up BOTH boxes | Run from the client (Iran) side: wipes the old tunnel from both servers, checks SSH to the peer works *before* changing anything, then reinstalls and reconfigures both ends in one go so the two halves can't drift out of sync. | Confirmation; peer SSH details if not saved. |
+| 12) Multiple tunnels (add / switch) | Opens the multi-tunnel submenu (below). | |
+| 13) Enable/disable BBR | Opens the BBR submenu (below). | |
 | 0) Exit | Quits. | |
 
 ### Port forwarding submenu (option 5)
@@ -119,7 +121,26 @@ icmptun-ctl.sh
 
 Add the port forward on whichever box real users actually connect to (usually the `client`), not necessarily the box running the real service.
 
-### BBR submenu (option 11)
+### Multiple tunnels submenu (option 12)
+
+One box can run any number of independent tunnels at once — several Iran servers into one foreign box, one Iran server out to several foreign boxes, or any mix.
+
+| Option | What it does | What it asks |
+|---|---|---|
+| 1) Add another tunnel (to a different peer) | Sets up a brand-new tunnel to a different peer alongside the existing one(s). It auto-picks a non-conflicting ICMP identifier, tunnel subnet and interface name so the new tunnel can't collide with any tunnel already on this box, then (optionally) installs and configures the new peer over SSH too. | New peer's real IP, and — if you want the peer set up automatically — its SSH details. |
+| 2) Manage a different tunnel (switch instance) | Re-launches the panel scoped to another tunnel so its status/start/stop/forwards act on that one. | Instance name. |
+| 0) Back | Returns to the main menu. | |
+
+**Important safety property:** when adding a tunnel whose foreign peer already runs an icmptun tunnel for *another* Iran box, the tool detects the existing tunnel and installs the new one as a separate instance on the peer — it never touches or disrupts the tunnel that is already running there.
+
+Under the hood each tunnel is an "instance" selected by an environment variable, so you can also drive them directly:
+
+```bash
+ICMPTUN_INSTANCE=second icmptun-ctl.sh status
+ICMPTUN_INSTANCE=second icmptun-ctl.sh pf add 700 both
+```
+
+### BBR submenu (option 13)
 
 | Option | What it does |
 |---|---|
