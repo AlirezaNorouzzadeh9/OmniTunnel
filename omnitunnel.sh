@@ -462,6 +462,91 @@ bench_run() {
     inst_enable "$kn"; ok "kept '$keep' as instance '$kn' on both sides."
 }
 
+# --------------------------------------------------- MANUAL benchmark ----------
+# Same benchmark, but with no SSH to the foreign box. The foreign side is
+# brought up once from a single pasted token; this side measures all four
+# tunnels, prints the table, and lets you keep one. Fixed bench subnets
+# (10.201.100-103) / ports (51900-51903) so both sides match deterministically.
+_bench_key_for() { case "$1" in udp) echo "$B_KUDP";; mux) echo "$B_KMUX";; tcp) echo "$B_KTCP";; *) echo "";; esac; }
+cmd_bench_manual() {
+    need_root; ensure_binary
+    local fhost="$1" mylip="${2:-$(default_local_ip)}"
+    [[ -n "$fhost" ]] || die "usage: bench-manual <foreign_ip> [my_ip]"
+    command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || true; }
+    local ku km kt; ku=$(gen_key); km=$(gen_key); kt=$(gen_key)
+    B_KUDP=$ku B_KMUX=$km B_KTCP=$kt
+    local token; token=$(printf 'bench|%s|%s|%s|%s|%s' "$fhost" "$mylip" "$ku" "$km" "$kt" | base64 | tr -d '\n')
+    echo
+    echo "${C_BOLD}Manual benchmark${C_RESET} ${C_DIM}(no SSH to the foreign box)${C_RESET}"
+    echo "1) On the FOREIGN server ($fhost) run these two lines:"
+    echo "   ${C_CYAN}bash <(curl -fsSL $RAW_BASE/install.sh)${C_RESET}"
+    echo "   ${C_CYAN}omnitunnel bench-server $token${C_RESET}"
+    read -rp "2) Press Enter here once it prints 'benchmark server ready'... " _
+    local raw_dl raw_ping
+    raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
+    raw_dl=$(iperf3 -c "$fhost" -p 5599 -t 5 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+    echo; printf "%b\n" "${C_BOLD}Measuring each tunnel...${C_RESET}"
+    local rows=() i=0 t
+    for t in $ALL_TYPES; do
+        local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
+        local ta="10.201.$sub.1" pa="10.201.$sub.2"
+        echo -n "  $t ... "
+        create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" none 8
+        inst_enable "$name" >/dev/null 2>&1; sleep 6
+        local out loss rtt dl
+        out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
+        rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
+        loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+        dl=$(iperf3 -c "$pa" -p 5599 -t 6 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        rows+=("$t|${dl:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL}"
+        inst_remove "$name" >/dev/null 2>&1
+        i=$((i+1))
+    done
+    echo; printf "%b\n" "${C_BOLD}${C_CYAN}==================== BENCHMARK RESULTS ====================${C_RESET}"
+    printf "  raw path : download %s , rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
+    printf "  %b%-6s %-18s %-7s %-9s%b\n" "$C_BOLD" "TYPE" "DOWNLOAD(tunnel)" "LOSS" "PING(ms)" "$C_RESET"
+    local r; for r in "${rows[@]}"; do IFS='|' read -r t dl ls pg <<< "$r"; printf "  %-6s %-18s %-7s %-9s\n" "$t" "$dl" "$ls" "$pg"; done
+    printf "%b\n" "${C_CYAN}===========================================================${C_RESET}"; echo
+    echo "${C_YELLOW}On the FOREIGN server, remove the test tunnels with:${C_RESET}  ${C_CYAN}omnitunnel bench-clean${C_RESET}"
+    echo
+    echo "Keep one as a permanent instance? (sets up its own fresh token)"
+    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
+    echo "  0) keep none"
+    read -rp "Choice: " ch; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
+    local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
+    read -rp "Name for the kept instance [main]: " kn; kn="${kn:-main}"
+    local nc=16 shape=none
+    [[ "$keep" == mux ]] && { read -rp "mux links N [16]: " nc; nc="${nc:-16}"; read -rp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
+    cmd_add_manual "$keep" "$kn" "$fhost" "$nc" "$shape" "$mylip"
+}
+# Foreign side: bring up all four server tunnels + an iperf3 server, from a token.
+cmd_bench_server() {
+    need_root; ensure_binary
+    local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid token"
+    local tag fhost mylip ku km kt; IFS='|' read -r tag fhost mylip ku km kt <<< "$dec"
+    [[ "$tag" == bench ]] || die "not a benchmark token"
+    B_KUDP=$ku B_KMUX=$km B_KTCP=$kt
+    command -v iperf3 >/dev/null || { apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
+    systemctl reset-failed omnitun-bench-iperf 2>/dev/null || true
+    systemd-run --unit=omnitun-bench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1 || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 &)
+    local i=0 t
+    for t in $ALL_TYPES; do
+        local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
+        local ta="10.201.$sub.1" pa="10.201.$sub.2"
+        inst_exists "$name" && inst_remove "$name" >/dev/null 2>&1
+        create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" none 8
+        inst_enable "$name" >/dev/null 2>&1
+        i=$((i+1))
+    done
+    ok "benchmark server ready - now press Enter on the Iran side."
+}
+cmd_bench_clean() {
+    need_root; local t
+    for t in $ALL_TYPES; do inst_remove "bench-$t" >/dev/null 2>&1 || true; done
+    systemctl stop omnitun-bench-iperf 2>/dev/null || true
+    ok "benchmark test tunnels removed."
+}
+
 # -------------------------------------------------------------------- menus ---
 banner() {
     clear 2>/dev/null || true
@@ -512,17 +597,19 @@ menu_main() {
     while true; do
         banner; local cnt; cnt=$(list_instances | grep -c . || true)
         echo "  ${C_DIM}active instances: $cnt${C_RESET}"; echo
-        echo "  ${C_BOLD}1)${C_RESET} Benchmark all tunnels & pick the best  ${C_DIM}(smart first run)${C_RESET}"
-        echo "  ${C_BOLD}2)${C_RESET} Manage tunnels (add / remove / restart)"
-        echo "  ${C_BOLD}3)${C_RESET} Port forwarding"
-        echo "  ${C_BOLD}4)${C_RESET} Show status of everything"
+        echo "  ${C_BOLD}1)${C_RESET} Benchmark all tunnels & pick the best  ${C_DIM}(auto: SSH to foreign)${C_RESET}"
+        echo "  ${C_BOLD}2)${C_RESET} Benchmark - ${C_YELLOW}MANUAL${C_RESET} ${C_DIM}(no SSH; paste a token on the foreign)${C_RESET}"
+        echo "  ${C_BOLD}3)${C_RESET} Manage tunnels (add / remove / restart)"
+        echo "  ${C_BOLD}4)${C_RESET} Port forwarding"
+        echo "  ${C_BOLD}5)${C_RESET} Show status of everything"
         echo "  ${C_BOLD}0)${C_RESET} Exit"
         read -rp "Choice: " c
         case "$c" in
             1) bench_run; pause;;
-            2) menu_instances;;
-            3) menu_pf;;
-            4) banner; for n in $(list_instances); do inst_status "$n"; done; pause;;
+            2) local fh mip; read -rp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -rp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
+            3) menu_instances;;
+            4) menu_pf;;
+            5) banner; for n in $(list_instances); do inst_status "$n"; done; pause;;
             0) exit 0;;
         esac
     done
@@ -537,6 +624,9 @@ case "${1:-menu}" in
     add-auto)         shift; cmd_add_auto "$@";;
     add-manual)       shift; cmd_add_manual "$@";;
     server-token)     need_root; cmd_server_token "${2:?token}";;
+    bench-manual)     shift; cmd_bench_manual "$@";;
+    bench-server)     need_root; cmd_bench_server "${2:?token}";;
+    bench-clean)      need_root; cmd_bench_clean;;
     list)             for n in $(list_instances); do inst_status "$n"; done;;
     status)           inst_status "${2:?instance}";;
     enable)           inst_enable "${2:?instance}";;
