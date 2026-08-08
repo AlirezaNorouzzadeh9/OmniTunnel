@@ -1,4 +1,4 @@
-/* tsuite - multi-protocol obfuscated tunnel core. One static binary that
+/* OmniTunnel - multi-protocol obfuscated tunnel core. One static binary that
  * dispatches to the requested transport; the bash manager drives it. */
 #include <stdio.h>
 #include <string.h>
@@ -12,7 +12,7 @@ int tun_main_icmp(int, char **);
 
 static void usage(const char *a) {
     fprintf(stderr,
-        "tsuite " TSUITE_VERSION " - multi-protocol tunnel core\n"
+        "omnitun " TSUITE_VERSION " - multi-protocol tunnel core\n"
         "usage: %s <mode> [options]\n"
         "  modes:\n"
         "    udp    IP-over-UDP AEAD (obsctun)\n"
@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
     if (!strcmp(m, "mux"))  return tun_main_mux(argc - 1, argv + 1);
     if (!strcmp(m, "icmp")) return tun_main_icmp(argc - 1, argv + 1);
     if (!strcmp(m, "version") || !strcmp(m, "-v") || !strcmp(m, "--version")) {
-        printf("tsuite %s\n", TSUITE_VERSION); return 0;
+        printf("omnitun %s\n", TSUITE_VERSION); return 0;
     }
     usage(argv[0]); return 1;
 }
