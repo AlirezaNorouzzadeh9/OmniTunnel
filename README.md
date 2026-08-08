@@ -15,7 +15,7 @@ ICMP is now just one of the five transports.)
 ## Why five transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
-**per-route and per-transport**, and it changes. OmniTunnel ships all four and
+**per-route and per-transport**, and it changes. OmniTunnel ships all five and
 lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
