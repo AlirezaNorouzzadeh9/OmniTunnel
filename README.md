@@ -84,7 +84,7 @@ From the main menu choose **“Benchmark all tunnels & pick the best.”** Point
 at a foreign server (IP + SSH login) and it will:
 
 1. measure the **raw** path (download + rtt),
-2. bring up each of the five tunnels in turn and measure **download, packet
+2. bring up each of the six tunnels in turn and measure **download, packet
    loss and ping** through it,
 3. print a comparison table,
 4. **remove every test tunnel from both sides**, then let you keep exactly one
