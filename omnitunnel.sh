@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.3"
+VERSION="2.4.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -491,6 +491,15 @@ inst_status() {
         else detail="${C_GREEN}interface up${C_RESET}"; fi
     else detail="${C_BYEL}starting...${C_RESET}"; fi
     printf '     %b%s%b %s\n' "$C_GREY" "$G_V" "$C_RESET" "$detail"
+    # endpoints line: the tunnel's own local IPs - BOTH ends, shown on the Iran
+    # box: the Iran-side tunnel IP (this box) and the foreign-side tunnel IP.
+    # Labels follow the role (this box is Iran when client, foreign when server).
+    local ir fo
+    if [[ "$ROLE" == server ]]; then ir="$PEER_ADDR"; fo="$TUN_ADDR"; else ir="$TUN_ADDR"; fo="$PEER_ADDR"; fi
+    printf '     %b%s%b %btunnel-ip%b %biran%b %b%-15s%b %bforeign%b %b%s%b\n' \
+        "$C_GREY" "$G_V" "$C_RESET" "$C_DIM" "$C_RESET" \
+        "$C_GREEN" "$C_RESET" "$C_BOLD$C_WHITE" "$ir" "$C_RESET" \
+        "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$fo" "$C_RESET"
 }
 
 # ------------------------------------------------------------- port fwd -------
