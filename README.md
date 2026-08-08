@@ -1,198 +1,191 @@
-# icmptun
+# OmniTunnel
 
-**[free-guy-ir.github.io/icmptun](https://free-guy-ir.github.io/icmptun/)**
+**A multi-protocol, obfuscated tunnel suite for bypassing per-destination
+traffic policing and DPI.** One prebuilt static core binary, one English
+menu-driven manager, four interchangeable tunnel transports, and any
+many-to-many topology you need.
 
-A point-to-point IP tunnel that disguises all traffic as ordinary ICMP echo request/reply packets, for links where most protocols are silently throttled or dropped but plain ICMP passes cleanly. Carries any IP traffic transparently (TCP, UDP, even ICMP itself) once the interface is up, so standard `iptables` DNAT port-forwarding works with zero protocol-specific code.
+Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
+police, throttle, or block traffic very differently depending on the transport
+and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
+ICMP is now just one of the four transports.)
 
-Single self-contained script: the C tunnel core is embedded in `icmptun-ctl.sh` and regenerated on every build, so there's only one file to deploy.
+---
+
+## Why four transports?
+
+No single tunnel wins everywhere. What an ISP lets through — and how fast — is
+**per-route and per-transport**, and it changes. OmniTunnel ships all four and
+lets you **benchmark them and keep the winner**:
+
+| Mode | What it is | Best when |
+|------|------------|-----------|
+| `udp`  | IP-over-UDP, XChaCha20-Poly1305, no header/handshake | UDP is allowed — usually the fastest, closest to raw |
+| `tcp`  | IP-over-TCP, one connection that looks like a long HTTPS session | UDP is blocked but a single TCP stream runs clean |
+| `mux`  | **Multi-connection TCP** — N parallel links, each inner flow pinned to one link | Hostile DPI that blocks UDP *and* poisons long-lived TCP 5-tuples |
+| `icmp` | IP-over-ICMP, blends in as ping (no key) | Only ICMP passes untouched |
+
+The `mux` transport is the headline. On an ISP that blocks UDP and drops ~half
+of new TCP handshakes, a naive single TCP tunnel melts down to a fraction of
+the path. `mux` opens N links (each retried from a **fresh source port** until
+one lands), spreads inner flows across them, and paces the aggregate just under
+the raw rate so the links never overshoot — reaching **~90% of the raw path
+speed** where a single tunnel managed under 15%.
+
+All obfuscated transports are **unsignatured**: a random 24-byte nonce followed
+by AEAD ciphertext, no magic bytes, no plaintext handshake — indistinguishable
+from random traffic to a DPI box.
+
+---
 
 ## Install
 
-One command, on each box you're tunneling between:
+No compiler needed — the right static binary for your CPU (**amd64** or
+**arm64**) ships with the project.
+
+### Run this one line on your **Iran** server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/icmptun/main/install.sh -o /tmp/icmptun-install.sh && sudo bash /tmp/icmptun-install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh) && omnitunnel
 ```
 
-That's the entire install — it downloads `icmptun-ctl.sh` to `/usr/local/bin/` and drops you straight into the setup wizard. No manual file transfer, no separate build step. If `raw.githubusercontent.com` is itself filtered, fetch it through a SOCKS5 proxy instead:
+That's it. You run it **only on the Iran side**. When you add a tunnel (or run
+the benchmark), the manager asks for the foreign server's IP and SSH login and
+then **installs and configures the foreign side for you automatically over
+SSH** — deploys the matching binary for the foreign box's CPU, brings up the
+server end, and enables it on boot. You never have to log into the foreign box
+by hand.
+
+> Prefer to set the foreign side up yourself? Just run the same one-liner there
+> too — the tool is symmetric.
+
+From a checkout instead of the one-liner:
 
 ```bash
-sudo bash /tmp/icmptun-install.sh --socks5 127.0.0.1:1080
+git clone https://github.com/Free-Guy-IR/OmniTunnel
+cd OmniTunnel && sudo ./install.sh && omnitunnel
 ```
 
-## Why
+---
 
-Some network paths apply protocol-blind traffic policing: TCP, UDP, GRE, and TLS relays all get an initial burst through and then go silent, with no RST or ICMP-unreachable — while bare ICMP keeps working under the same conditions. This tunnel wraps arbitrary IP packets inside genuine-looking ICMP echo request/reply pairs (the client always sends type-8, the server always replies with a real type-0 reply) to avoid a common failure mode: paths that apply direction-aware policy to ICMP, permitting traffic that looks like a reply to a locally-initiated request while treating an unsolicited inbound echo *request* as a fresh connection subject to stricter policy.
+## First run: benchmark & pick the best
 
-## Features
+From the main menu choose **“Benchmark all tunnels & pick the best.”** Point it
+at a foreign server (IP + SSH login) and it will:
 
-- **Self-contained**: brings its own interface up (address + point-to-point route) from inside the process itself — no external `ip addr`/`ip link` calls needed before or after starting it.
-- **Per-flow reordering**: packet reordering on the underlying path is corrected per-flow (keyed by each inner packet's real 5-tuple), not with one shared buffer — so a reordering event on one TCP connection can never delay unrelated flows or a health-check ping.
-- **TCP + UDP port forwarding**: add/remove/list forwarded ports through a proper `iptables` DNAT + MASQUERADE chain, fully isolated in its own custom chains.
-- **Pre-flight conflict detection**: before adding a forward, warns if another DNAT rule or a local listener already claims that port, so a stale conflicting rule can't silently swallow your traffic.
-- **Multi-instance**: run more than one independent tunnel on the same box at once (e.g. several Iran-side servers into one foreign box, or the reverse) — each instance gets its own config, binary, systemd unit, and iptables chains via `ICMPTUN_INSTANCE=<name>`.
-- **Interactive menu by default**, direct CLI subcommands for scripting (`icmptun-ctl.sh pf add 8080 both`).
-- **systemd-native**: `Type=simple`, no PID file — the binary is fully self-configuring, so systemd's own process tracking is always accurate.
-- **BBR toggle** for the underlying TCP congestion control, since it tends to hold throughput better than cubic on a path with occasional loss/reordering.
+1. measure the **raw** path (download + rtt),
+2. bring up each of the four tunnels in turn and measure **download, packet
+   loss and ping** through it,
+3. print a comparison table,
+4. **remove every test tunnel from both sides**, then let you keep exactly one
+   as a permanent instance.
 
-## Quick start
+```
+==================== BENCHMARK RESULTS ====================
+  raw path : download 180 Mbits/sec , rtt 38 ms
+  TYPE   DOWNLOAD(tunnel)   LOSS    PING(ms)
+  udp    9.2 Mbits/sec      23%     41
+  mux    88  Mbits/sec      0%      40
+  tcp    11  Mbits/sec      0%      39
+  icmp   6.4 Mbits/sec      1%      44
+===========================================================
+```
 
-After running the install command above on both boxes, you're already inside the interactive menu on each — it walks you through initial setup on first run. Re-launch it anytime with:
+You can re-run the benchmark from the menu any time conditions change.
+
+---
+
+## Topologies (many-to-many)
+
+Each tunnel is an **instance** with its own tun device, systemd unit, subnet,
+port and port-forward chain, so any shape works and instances never collide:
+
+- **one Iran → many foreign** — add several instances on one box
+- **many Iran → one foreign** — the foreign box hosts one server instance per
+  Iran box
+- **many → many** — any combination of the above
+
+The manager auto-allocates a non-overlapping subnet and a free port for every
+new instance, and (given an SSH login to the far side) brings up both ends.
+
+---
+
+## Port forwarding
+
+Expose a port on one side and have it tunneled to the other:
 
 ```bash
-icmptun-ctl.sh
+omnitunnel pf-add <instance> both 443     # tcp+udp 443 -> peer over the tunnel
+omnitunnel pf-add <instance> tcp  8080
+omnitunnel pf-del <instance> 443
 ```
 
-Or configure non-interactively on each end:
+or use the **Port forwarding** menu.
+
+---
+
+## CLI (for scripting)
 
 ```bash
-# foreign server (has the real public IP the client reaches)
-icmptun-ctl.sh init --role server -L <this-box-real-ip> -R <other-box-real-ip>
-icmptun-ctl.sh enable
-
-# the other end
-icmptun-ctl.sh init --role client -L <this-box-real-ip> -R <other-box-real-ip>
-icmptun-ctl.sh enable
+omnitunnel add                       # interactive add wizard
+omnitunnel add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
+omnitunnel list
+omnitunnel status  <instance>
+omnitunnel remove  <instance>        # removes ONLY that instance (both-side safe)
+omnitunnel pf-add  <instance> <tcp|udp|both> <port>
+omnitunnel bench
 ```
 
-Then forward a port through the tunnel from whichever side should expose it publicly:
+The core binary can also be driven directly:
 
 ```bash
-icmptun-ctl.sh pf add 8080 both      # tcp+udp, defaults to the tunnel's other end, same port
-icmptun-ctl.sh pf add 443 tcp 10.0.0.5 8443   # or target a specific IP:port reachable from the far side
+omnitun mux -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> \
+            -p <port> -k <64-hex-key> -N 16 [-s] -T <dev> -M 1400
+omnitun udp  ...     omnitun tcp  ...     omnitun icmp ...
 ```
 
-## Guide
+`-s` marks the server (listening) side; the client omits it.
 
-### First-run setup wizard
-
-Running `icmptun-ctl.sh` with nothing configured yet walks you through these prompts:
-
-| Prompt | What to enter |
-|---|---|
-| Role? (1=client / 2=server) | The box with a real IP reachable from outside → **server**. The box that initiates the connection (typically the more restricted one) → **client**. |
-| This server's real IP | Auto-detected and pre-filled — just press Enter if it looks right. |
-| Peer server's real IP | The other box's real IP. |
-| ICMP identifier, hex [4d54] | Enter. Only change this if you're running more than one independent tunnel on the same box. |
-| MTU [1400] | Enter. |
-| Tunnel's internal IP (this end / peer) | Enter. Used only between the two tunnel ends, unrelated to the real IPs. Only needs to change if you're running several tunnels on the same box at once (each needs its own non-overlapping range). |
-| Start and enable the systemd service now? (Y/n) | Enter (yes) — makes it auto-start on boot and auto-restart if it ever crashes. |
-
-Do this on **both** boxes (one as `server`, one as `client`). Afterward, launch the panel anytime with:
-
-```bash
-icmptun-ctl.sh
-```
-
-### Main menu
-
-**tunnel**
-
-| Option | What it does |
-|---|---|
-| 1) Status | Full health check: process/interface state, ping to the peer, active port forwards. |
-| 2) Start | Brings the tunnel up (no-op if already running). |
-| 3) Stop | Takes the tunnel down. |
-| 4) Restart | Stop then start — useful after a change or to clear a stuck state. |
-| 5) Port forwarding | Opens the port-forwarding submenu (below). |
-| 6) Ping + speed test | Pings the peer; if `iperf3` is installed, also runs a throughput test (needs `iperf3 -s -D` running on the peer first). |
-
-**system**
-
-| Option | What it does | What it asks |
-|---|---|---|
-| 7) Enable auto-start | Installs/enables the systemd service — auto-starts on boot, auto-restarts on crash. | Nothing. |
-| 8) Remove tunnel | Two levels: **remove** (tears the tunnel + every iptables rule and port forward off this box and the peer, but keeps config so `start` can bring it back), or **purge** (also deletes config, binaries and saved settings on both boxes). Both are symmetric — nothing is left half-removed on either side. | Which level, then confirmation (y/N). Uses saved peer SSH details (option 9); asks for them if not saved. |
-| 9) Set peer SSH connection details | Saves the peer's SSH host/port/user/password once, so options 8 and 11 can reach it later without asking again. | IP/host, port, user, password, optional SOCKS5 proxy. |
-| 10) Reconfigure (re-init) | Re-runs the setup prompts for this tunnel. Validates that the IP you give as "this server's IP" actually belongs to this machine — catches the common mistake of pasting the peer's IP, which otherwise makes the tunnel fail silently and restart forever. | Same as the setup wizard above. |
-| 11) Full reinstall — wipe & set up BOTH boxes | Run from the client (Iran) side: wipes the old tunnel from both servers, checks SSH to the peer works *before* changing anything, then reinstalls and reconfigures both ends in one go so the two halves can't drift out of sync. | Confirmation; peer SSH details if not saved. |
-| 12) Multiple tunnels (add / switch) | Opens the multi-tunnel submenu (below). | |
-| 13) Enable/disable BBR | Opens the BBR submenu (below). | |
-| 0) Exit | Quits. | |
-
-### Port forwarding submenu (option 5)
-
-| Option | What it does | What it asks |
-|---|---|---|
-| 1) Add a port forward | Forwards a public port on this box, through the tunnel, to the peer side. | Public port → protocol (1=tcp, 2=udp, 3=both) → target IP (Enter = the tunnel peer itself) → target port (Enter = same port). |
-| 2) Remove a port forward | Removes one. | Shows a numbered list — enter the row number. |
-| 3) Clear all | Removes every forward. | Confirmation (y/N). |
-| 0) Back | Returns to the main menu. | |
-
-Add the port forward on whichever box real users actually connect to (usually the `client`), not necessarily the box running the real service.
-
-### Multiple tunnels submenu (option 12)
-
-One box can run any number of independent tunnels at once — several Iran servers into one foreign box, one Iran server out to several foreign boxes, or any mix.
-
-| Option | What it does | What it asks |
-|---|---|---|
-| 1) Add another tunnel (to a different peer) | Sets up a brand-new tunnel to a different peer alongside the existing one(s). It auto-picks a non-conflicting ICMP identifier, tunnel subnet and interface name so the new tunnel can't collide with any tunnel already on this box, then (optionally) installs and configures the new peer over SSH too. | New peer's real IP, and — if you want the peer set up automatically — its SSH details. |
-| 2) Manage a different tunnel (switch instance) | Re-launches the panel scoped to another tunnel so its status/start/stop/forwards act on that one. | Instance name. |
-| 0) Back | Returns to the main menu. | |
-
-**Important safety property:** when adding a tunnel whose foreign peer already runs an icmptun tunnel for *another* Iran box, the tool detects the existing tunnel and installs the new one as a separate instance on the peer — it never touches or disrupts the tunnel that is already running there.
-
-Under the hood each tunnel is an "instance" selected by an environment variable, so you can also drive them directly:
-
-```bash
-ICMPTUN_INSTANCE=second icmptun-ctl.sh status
-ICMPTUN_INSTANCE=second icmptun-ctl.sh pf add 700 both
-```
-
-### BBR submenu (option 13)
-
-| Option | What it does |
-|---|---|
-| 1) Enable BBR | Switches TCP congestion control to BBR (usually better throughput on a path with occasional loss/reordering) — persists across reboots. |
-| 2) Disable BBR | Reverts to cubic (the Linux default). |
-| 0) Back | Returns to the main menu. |
-
-### Direct CLI commands
-
-Every menu action is also a direct subcommand, for quick one-off calls or scripting:
-
-```
-icmptun-ctl.sh                 # interactive menu (status, start/stop, port forwards, BBR, ...)
-icmptun-ctl.sh status           # tunnel health, ping to peer, active forwards
-icmptun-ctl.sh pf add|del|list|flush ...
-icmptun-ctl.sh start|stop|restart|enable
-icmptun-ctl.sh bbr on|off|status
-icmptun-ctl.sh logs [-f]
-icmptun-ctl.sh remove [both]    # tear down locally, optionally also on the peer via saved SSH creds
-```
-
-Running a second, independent tunnel on the same box:
-
-```bash
-ICMPTUN_INSTANCE=second icmptun-ctl.sh init --role client -L <ip> -R <ip> -A 10.97.0.1 -P 10.97.0.2
-ICMPTUN_INSTANCE=second icmptun-ctl.sh enable
-ICMPTUN_INSTANCE=second icmptun-ctl.sh pf add 700 both
-```
+---
 
 ## Architecture
 
+- **One static core binary** (`omnitun`) — a busybox-style multi-call program
+  that dispatches to `udp` / `tcp` / `mux` / `icmp`. No shared-library
+  dependencies: crypto is vendored ([Monocypher](https://monocypher.org),
+  XChaCha20-Poly1305), so it builds and cross-compiles trivially and runs on
+  any modern Linux kernel.
+- Prebuilt for **amd64** and **arm64** under [`bin/`](bin/), also attached to
+  each release.
+- **`omnitunnel.sh`** — the English TUI manager: benchmark, instance
+  add/remove/restart, port forwarding, systemd persistence, BBR + fq/tbf
+  tuning, and automatic far-side provisioning over SSH.
+- State lives under `/etc/omnitunnel` and never touches an existing
+  `/etc/icmptun` install.
+
+Build from source (any Linux with gcc):
+
+```bash
+cd src
+gcc -O2 -Wall -o omnitun main.c obsctun.c obsctcp.c obscmux.c icmptun.c monocypher.c -lpthread -static
+# arm64:
+aarch64-linux-gnu-gcc -O2 -Wall -o omnitun-arm64 main.c obsctun.c obsctcp.c obscmux.c icmptun.c monocypher.c -lpthread -static
 ```
-   client box                                          server box
- ┌───────────────┐        genuine ICMP echo          ┌───────────────┐
- │  local apps    │  ─── request (type 8) ──────►     │  local apps   │
- │      │         │                                    │      │        │
- │   tun0 (IP)    │  ◄── genuine ICMP echo             │   tun0 (IP)   │
- │      │         │      reply (type 0) ────           │      │        │
- │  icmptun core  │                                    │  icmptun core │
- └───────┬───────┘                                    └───────┬───────┘
-         │                raw ICMP socket                      │
-         └──────────────── public internet ───────────────────┘
-```
 
-Each side reads plain IP packets off its TUN device, wraps them in an ICMP packet addressed to the peer's real IP, and the far end unwraps and re-injects them into its own TUN device. Port forwards are plain `iptables` DNAT rules pointed at the tunnel's own point-to-point address, so any TCP/UDP service reachable from the far end can be exposed through either box.
+---
 
-## Requirements
+## Notes on performance
 
-- Linux, root (raw socket + `/dev/net/tun`)
-- `gcc`, `iptables`, `systemd`
-- OpenBSD `nc` if using the SOCKS5-proxy option for peer-to-peer management commands
+- Throughput is **per-route and time-variable**; benchmark on your own pair of
+  servers, and re-benchmark whenever conditions change.
+- No tunnel exceeds the raw path — obfuscation defeats *recognition/policing*,
+  not physics. If the raw route to a given foreign datacenter is capped, pick a
+  different foreign IP/datacenter.
+- `mux` performs best with a shaper set a touch under the raw rate (the add
+  wizard asks); use the sustainable, not the burst, path capacity.
+
+---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
