@@ -4,10 +4,13 @@
 # TUI. No compiler needed on the box: the right binary for the CPU (amd64 or
 # arm64) is shipped with the project.
 #
-#   udp    IP-over-UDP AEAD       - fastest on open / UDP-friendly routes
-#   tcp    IP-over-TCP AEAD       - one HTTPS-looking connection
-#   mux    multi-connection TCP   - N parallel links; beats UDP-blocking DPI
-#   icmp   IP-over-ICMP           - blends in as ping (no key)
+#   gre      IP-over-GRE (kernel)  - often unpoliced / full line-rate
+#   icmp     IP-over-ICMP          - blends in as ping (no key)
+#   udp      IP-over-UDP AEAD      - fastest on open / UDP-friendly routes
+#   tcp      IP-over-TCP AEAD      - one HTTPS-looking connection
+#   mux      multi-connection TCP  - N parallel links; beats UDP-blocking DPI
+#   ws       multi-connection WS   - looks like a browser/CDN WebSocket
+#   hysteria Hysteria2 / QUIC      - Brutal CC beats UDP rate-policing; looks like HTTP/3
 #
 # One box runs many independent tunnels at once ("instances"), so any topology
 # works: one Iran -> many foreign, one foreign -> many Iran, or many-to-many.
@@ -17,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.2.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -25,6 +28,12 @@ ROOT_DIR="/etc/omnitunnel"
 INST_DIR="$ROOT_DIR/inst"
 PEER_DIR="$ROOT_DIR/peers"
 TSUITE_BIN="/usr/local/bin/omnitun"
+# Hysteria2 is a separate Go engine (QUIC/UDP with the loss-agnostic "Brutal"
+# congestion control). We ship its static binary alongside our C core and drive
+# it through generated YAML - it is the stealthiest fast transport (looks like
+# HTTP/3, with salamander obfs + website masquerade).
+HYSTERIA_BIN="/usr/local/bin/hysteria"
+HY_MASQ_HOST="www.bing.com"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
 RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
@@ -51,16 +60,39 @@ ensure_binary() {
     install -m 0755 "$cand" "$TSUITE_BIN"
 }
 
+# locate this box's hysteria binary (shipped in bin/, or downloadable)
+hy_local_bin() {
+    local a="$1" d
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/hysteria-$a" ]] && { echo "$d/hysteria-$a"; return 0; }; done
+    return 1
+}
+# make sure /usr/local/bin/hysteria exists for this CPU (ship-first, download-fallback)
+ensure_hysteria() {
+    [[ -x "$HYSTERIA_BIN" ]] && return 0
+    local a; a="$(arch_tag)"; [[ "$a" == unknown ]] && die "unsupported CPU: $(uname -m)"
+    local cand; cand="$(hy_local_bin "$a" || true)"
+    if [[ -z "$cand" ]]; then
+        info "  fetching hysteria core for $a ..."
+        mkdir -p "$ASSET_DIR/bin"
+        curl -fsSL -o "$ASSET_DIR/bin/hysteria-$a" \
+            "https://github.com/apernet/hysteria/releases/download/app%2Fv2.12.0/hysteria-linux-$a" \
+            || die "could not obtain hysteria-$a (no shipped copy and download failed)"
+        chmod +x "$ASSET_DIR/bin/hysteria-$a"; cand="$ASSET_DIR/bin/hysteria-$a"
+    fi
+    install -m 0755 "$cand" "$HYSTERIA_BIN"
+}
+
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws tcp"
+ALL_TYPES="gre icmp udp mux ws hysteria tcp"
 type_desc() {
     case "$1" in
-        gre)  echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
-        icmp) echo "IP-over-ICMP  (blends in as ping; no key)";;
-        udp)  echo "IP-over-UDP AEAD  (fastest where UDP is allowed)";;
-        mux)  echo "multi-connection TCP  (N links; for UDP-blocking DPI)";;
-        ws)   echo "multi-connection WebSocket  (looks like HTTPS; stealthiest)";;
-        tcp)  echo "single TCP AEAD  (looks like one HTTPS connection)";;
+        gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
+        icmp)     echo "IP-over-ICMP  (blends in as ping; no key)";;
+        udp)      echo "IP-over-UDP AEAD  (fastest where UDP is allowed)";;
+        mux)      echo "multi-connection TCP  (N links; for UDP-blocking DPI)";;
+        ws)       echo "multi-connection WebSocket  (looks like HTTPS; stealthy)";;
+        hysteria) echo "Hysteria2/QUIC  (loss-agnostic; beats UDP rate-policing; looks like HTTP/3)";;
+        tcp)      echo "single TCP AEAD  (looks like one HTTPS connection)";;
         *) echo "";;
     esac
 }
@@ -68,6 +100,9 @@ type_desc() {
 type_uses_key() { [[ "$1" != icmp && "$1" != gre ]]; }
 # gre is a native kernel tunnel - no compiled core binary involved
 type_is_kernel() { [[ "$1" == gre ]]; }
+# hysteria is a separate engine: its own binary + YAML, no tun device, forwards
+# ports natively (no iptables DNAT). It gets special-cased throughout.
+type_is_hysteria() { [[ "$1" == hysteria ]]; }
 
 # ------------------------------------------------------------ instance i/o ----
 inst_path() { echo "$INST_DIR/$1"; }
@@ -120,6 +155,77 @@ build_execstart() {
     esac
 }
 
+# ------------------------------------------------------- hysteria config ------
+# One 64-hex KEY seeds both the auth password and the salamander obfs password,
+# so the two ends stay in sync from the same secret.
+hy_creds() { HY_AUTH="${KEY:0:32}"; HY_OBFS="${KEY:32:32}"; [[ -n "$HY_OBFS" ]] || HY_OBFS="$HY_AUTH"; }
+hy_bw() { case "${1:-}" in ''|none|0) echo 200;; *) echo "${1%%[a-z]*}";; esac; }  # -> mbps number
+# self-signed cert (masquerade CN) generated once per instance
+hy_cert() {
+    local d="$1"; [[ -f "$d/hy.crt" && -f "$d/hy.key" ]] && return 0
+    openssl req -x509 -newkey rsa:2048 -keyout "$d/hy.key" -out "$d/hy.crt" \
+        -days 3650 -nodes -subj "/CN=$HY_MASQ_HOST" >/dev/null 2>&1 || die "openssl needed for hysteria cert"
+    chmod 600 "$d/hy.key"
+}
+# render /etc/omnitunnel/inst/<n>/hy.yaml from instance.conf (+ pf.conf on client)
+hy_write_config() {
+    local n="$1"; load_inst "$n"; local d yaml; d="$(inst_path "$n")"; yaml="$d/hy.yaml"; hy_creds
+    if [[ "$ROLE" == server ]]; then
+        hy_cert "$d"
+        cat > "$yaml" <<EOF
+listen: :$PORT
+tls:
+  cert: $d/hy.crt
+  key: $d/hy.key
+obfs:
+  type: salamander
+  salamander:
+    password: $HY_OBFS
+auth:
+  type: password
+  password: $HY_AUTH
+masquerade:
+  type: proxy
+  proxy:
+    url: https://$HY_MASQ_HOST/
+    rewriteHost: true
+EOF
+    else
+        local bw; bw="$(hy_bw "$SHAPE")"
+        cat > "$yaml" <<EOF
+server: $PEER_IP:$PORT
+auth: $HY_AUTH
+tls:
+  insecure: true
+  sni: $HY_MASQ_HOST
+obfs:
+  type: salamander
+  salamander:
+    password: $HY_OBFS
+bandwidth:
+  up: ${bw} mbps
+  down: ${bw} mbps
+socks5:
+  listen: 127.0.0.1:$PORT
+EOF
+        # A localhost SOCKS5 is always present so the engine has a "mode" and
+        # stays connected even before any port-forward is added (and it doubles
+        # as a ready-to-use proxy through the tunnel). Port-forwards add on top.
+        # forwarded ports become native hysteria forwards (server dials 127.0.0.1)
+        local pf tcp_e="" udp_e="" proto port; pf="$(inst_pf "$n")"
+        if [[ -s "$pf" ]]; then
+            while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
+                local blk="  - listen: 0.0.0.0:$port"$'\n'"    remote: 127.0.0.1:$port"$'\n'
+                [[ "$proto" == tcp ]] && tcp_e+="$blk"
+                [[ "$proto" == udp ]] && udp_e+="$blk"
+            done < "$pf"
+        fi
+        [[ -n "$tcp_e" ]] && { echo "tcpForwarding:" >> "$yaml"; printf '%s' "$tcp_e" >> "$yaml"; }
+        [[ -n "$udp_e" ]] && { echo "udpForwarding:" >> "$yaml"; printf '%s' "$udp_e" >> "$yaml"; }
+    fi
+    chmod 600 "$yaml"
+}
+
 # ------------------------------------------------------------- tuning ---------
 apply_tuning() {
     local dev="$1" shape="${2:-none}"
@@ -145,9 +251,29 @@ apply_tuning() {
 # --------------------------------------------------- systemd unit + enable ----
 write_service() {
     load_inst "$1"
-    type_is_kernel "$TYPE" || ensure_binary
+    if type_is_hysteria "$TYPE"; then ensure_hysteria
+    elif ! type_is_kernel "$TYPE"; then ensure_binary; fi
     local unit="/etc/systemd/system/$(svc_name "$1")"
-    if type_is_kernel "$TYPE"; then
+    if type_is_hysteria "$TYPE"; then
+        hy_write_config "$1"
+        local mode=client; [[ "$ROLE" == server ]] && mode=server
+        cat > "$unit" <<EOF
+[Unit]
+Description=OmniTunnel hysteria instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$HYSTERIA_BIN $mode -c $(inst_path "$1")/hy.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    elif type_is_kernel "$TYPE"; then
         # GRE (or other native kernel carrier): configured on start, removed on
         # stop. PORT doubles as the GRE key so several GRE tunnels can share an
         # endpoint pair without colliding. No compiled core binary involved.
@@ -218,7 +344,15 @@ inst_status() {
 
 # ------------------------------------------------------------- port fwd -------
 pf_apply_all() {
-    load_inst "$1"; local pf; pf="$(inst_pf "$1")"; [[ -f "$pf" ]] || return 0
+    load_inst "$1"
+    # hysteria forwards ports inside its own config, not via iptables: rewrite
+    # the YAML from pf.conf and bounce the service.
+    if type_is_hysteria "$TYPE"; then
+        hy_write_config "$1"
+        inst_running "$1" && systemctl restart "$(svc_name "$1")" 2>/dev/null || true
+        return 0
+    fi
+    local pf; pf="$(inst_pf "$1")"; [[ -f "$pf" ]] || return 0
     local ch; ch="$(dnat_chain "$1")"
     iptables -t nat -N "$ch" 2>/dev/null || true; iptables -t nat -F "$ch"
     iptables -t nat -C PREROUTING -j "$ch" 2>/dev/null || iptables -t nat -I PREROUTING 1 -j "$ch"
@@ -304,17 +438,28 @@ provision_peer() {
     local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}"
     local parch; parch=$(peer_ssh "$h" "uname -m" 2>/dev/null | tr -d '\r')
     case "$parch" in x86_64|amd64) parch=amd64;; aarch64|arm64) parch=arm64;; *) die "peer $h has unsupported CPU: $parch";; esac
-    local pbin=""
-    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && pbin="$d/omnitun-$parch" && break; done
-    [[ -n "$pbin" ]] || die "no omnitun-$parch binary to send to peer"
-    info "  far side is $parch; deploying core + manager to $h ..."
+    info "  far side is $parch; deploying engine + manager to $h ..."
     peer_ssh "$h" "mkdir -p /opt/omnitunnel/bin"
-    peer_scp "$h" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
     peer_scp "$h" "$SCRIPT_PATH" "/opt/omnitunnel/omnitunnel.sh"
-    peer_ssh "$h" "chmod +x /opt/omnitunnel/omnitunnel.sh /opt/omnitunnel/bin/omnitun-$parch; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun; OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc'"
+    peer_ssh "$h" "chmod +x /opt/omnitunnel/omnitunnel.sh"
+    if type_is_hysteria "$t"; then
+        local hbin; hbin="$(hy_local_bin "$parch" || true)"
+        [[ -n "$hbin" ]] || die "no hysteria-$parch binary to send to peer"
+        peer_scp "$h" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria"
+    else
+        local pbin=""
+        for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && pbin="$d/omnitun-$parch" && break; done
+        [[ -n "$pbin" ]] || die "no omnitun-$parch binary to send to peer"
+        peer_scp "$h" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnitun-$parch; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun"
+    fi
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc'"
 }
 cmd_peercreate() {
-    need_root; ensure_binary
+    need_root
+    if type_is_hysteria "$2"; then ensure_hysteria
+    elif ! type_is_kernel "$2"; then ensure_binary; fi
     create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
     inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
 }
@@ -343,12 +488,14 @@ cmd_add_auto() {
 # It never touches any server's own sshd or port 22.
 # add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
 cmd_add_manual() {
-    need_root; ensure_binary
-    local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}"
-    [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
+    need_root
+    if type_is_hysteria "$1"; then ensure_hysteria
+    elif ! type_is_kernel "$1"; then ensure_binary; fi
+    local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}" want_port="${7:-}"
+    [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
     inst_exists "$kn" && die "instance $kn exists"
     local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
+    port=$(next_port "${want_port:-$((51820+sub))}"); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
@@ -365,11 +512,13 @@ cmd_add_manual() {
 }
 # Consume a token on the foreign box to bring up the matching server side.
 cmd_server_token() {
-    need_root; ensure_binary
+    need_root
     local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid token"
     local name t fhost mylip port key pta ppa shape nc
     IFS='|' read -r name t fhost mylip port key pta ppa shape nc <<< "$dec"
     [[ -n "$name" && -n "$t" ]] || die "invalid token"
+    if type_is_hysteria "$t"; then ensure_hysteria
+    elif ! type_is_kernel "$t"; then ensure_binary; fi
     inst_exists "$name" && die "instance $name already exists"
     create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc"
     inst_enable "$name"
@@ -393,6 +542,8 @@ wizard_add() {
     if [[ "$t" == mux ]]; then
         read -rp "Parallel links N [16]: " nc; nc="${nc:-16}"
         read -rp "Download shaper rate to stabilise (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
+    elif [[ "$t" == hysteria ]]; then
+        read -rp "Brutal-CC target bandwidth in mbps (higher pushes harder through loss) [200]: " shape; shape="${shape:-200}"
     fi
     local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(next_port $((51820+sub))); key=$(gen_key)
@@ -440,6 +591,9 @@ bench_run() {
     peer_scp "$fhost" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
     peer_scp "$fhost" "$SCRIPT_PATH" "/opt/omnitunnel/omnitunnel.sh"
     peer_ssh "$fhost" "chmod +x /opt/omnitunnel/omnitunnel.sh; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun; command -v iperf3 >/dev/null || (apt-get install -y iperf3 || yum install -y iperf3) >/dev/null 2>&1; (systemctl reset-failed tsbench-iperf 2>/dev/null; systemd-run --unit=tsbench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1) || (pkill -f 'iperf3 -s -p 5599'; setsid iperf3 -s -p 5599 >/dev/null 2>&1 &)" || true
+    # hysteria engine for the far side too (so its bench server can come up)
+    local hbin; hbin="$(hy_local_bin "$parch" || true)"
+    [[ -n "$hbin" ]] && { peer_scp "$fhost" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch"; peer_ssh "$fhost" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria" >/dev/null 2>&1 || true; }
     sleep 1
 
     echo; printf "%b\n" "${C_BOLD}Raw path (no tunnel):${C_RESET}"
@@ -458,6 +612,20 @@ bench_run() {
         port=$(next_port $((51840+sub))); key=$(gen_key)
         [[ "$t" == icmp ]] && { key=""; }
         echo -n "  $t ... "
+        # hysteria has no tun/ping: forward the iperf port through it and measure
+        if type_is_hysteria "$t"; then
+            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '200' '$nc'" >/dev/null 2>&1
+            create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" 200 "$nc"
+            echo "tcp:5599" > "$(inst_pf "$name")"
+            inst_enable "$name" >/dev/null 2>&1; sleep 6
+            local hrtt hdl
+            hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
+            hdl=$(timeout 25 iperf3 -c 127.0.0.1 -p 5599 -t 6 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+            rows+=("$t|${hdl:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL}"
+            inst_remove "$name" >/dev/null 2>&1
+            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
+            continue
+        fi
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
         inst_enable "$name" >/dev/null 2>&1; sleep 6
@@ -488,6 +656,7 @@ bench_run() {
     read -rp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
     local nc=16 shape=none
     [[ "$keep" == mux ]] && { read -rp "mux links N [16]: " nc; nc="${nc:-16}"; read -rp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
+    [[ "$keep" == hysteria ]] && { read -rp "Brutal-CC target bandwidth mbps [200]: " shape; shape="${shape:-200}"; }
     local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$keep" == icmp || "$keep" == gre ]] && key=""
     provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
@@ -522,6 +691,7 @@ cmd_bench_manual() {
     echo; printf "%b\n" "${C_BOLD}Measuring each tunnel...${C_RESET}"
     local rows=() i=0 t
     for t in $ALL_TYPES; do
+        type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench (fixed keys) skips hysteria; use auto bench for it
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         echo -n "  $t ... "
@@ -565,6 +735,7 @@ cmd_bench_server() {
     systemd-run --unit=omnitun-bench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1 || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 &)
     local i=0 t
     for t in $ALL_TYPES; do
+        type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench skips hysteria (fixed-key token path)
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         inst_exists "$name" && inst_remove "$name" >/dev/null 2>&1

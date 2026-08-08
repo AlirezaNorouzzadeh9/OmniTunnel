@@ -1,21 +1,21 @@
 # OmniTunnel
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
-traffic policing and DPI.** One prebuilt static core binary, one English
-menu-driven manager, six interchangeable tunnel transports, and any
+traffic policing and DPI.** Prebuilt static binaries, one English
+menu-driven manager, seven interchangeable tunnel transports, and any
 many-to-many topology you need.
 
 Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
 police, throttle, or block traffic very differently depending on the transport
 and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
-ICMP is now just one of the six transports.)
+ICMP is now just one of the seven transports.)
 
 ---
 
-## Why six transports?
+## Why seven transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
-**per-route and per-transport**, and it changes. OmniTunnel ships all six and
+**per-route and per-transport**, and it changes. OmniTunnel ships all seven and
 lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
@@ -26,6 +26,7 @@ lets you **benchmark them and keep the winner**:
 | `tcp`  | IP-over-TCP, one connection that looks like a long HTTPS session | UDP is blocked but a single TCP stream runs clean |
 | `mux`  | **Multi-connection TCP** — N parallel links, each inner flow pinned to one link | Hostile DPI that blocks UDP *and* poisons long-lived TCP 5-tuples |
 | `ws`   | **Multi-connection WebSocket** — real HTTP `Upgrade` handshake, AEAD payload inside masked WS frames | You need `mux`'s throughput but the carrier must be **indistinguishable from a browser/CDN WebSocket** on 443/80 |
+| `hysteria` | **Hysteria2 / QUIC** — bundled engine with the loss-agnostic *Brutal* congestion control, salamander obfuscation and a real website masquerade | UDP passes but is **rate-policed or lossy**: Brutal ignores the induced loss and pushes at a fixed rate, so a policed UDP path that crawls at a few Mbit for `udp` runs an order of magnitude faster here — while looking exactly like HTTP/3 |
 
 Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
 protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
@@ -84,7 +85,7 @@ From the main menu choose **“Benchmark all tunnels & pick the best.”** Point
 at a foreign server (IP + SSH login) and it will:
 
 1. measure the **raw** path (download + rtt),
-2. bring up each of the six tunnels in turn and measure **download, packet
+2. bring up each of the seven tunnels in turn and measure **download, packet
    loss and ping** through it,
 3. print a comparison table,
 4. **remove every test tunnel from both sides**, then let you keep exactly one
@@ -95,21 +96,31 @@ Real numbers from a heavily-filtered Iran ISP (to one foreign box):
 ```
 ==================== BENCHMARK RESULTS ====================
   raw path : download 180 Mbits/sec (plain TCP - policed) , rtt 40 ms
-  TYPE   DOWNLOAD(tunnel)   LOSS    PING(ms)
-  gre    652 Mbits/sec      0%      40
-  icmp   350 Mbits/sec      0%      40
-  mux    87  Mbits/sec      0%      40
-  udp    3.8 Mbits/sec      23%     41
-  tcp    1.2 Mbits/sec      0%      86
+  TYPE      DOWNLOAD(tunnel)   LOSS    PING(ms)
+  gre       652 Mbits/sec      0%      40
+  icmp      350 Mbits/sec      0%      40
+  hysteria  100 Mbits/sec      0%      40
+  mux       87  Mbits/sec      0%      40
+  udp       3.8 Mbits/sec      23%     41
+  tcp       1.2 Mbits/sec      0%      86
 ===========================================================
 ```
 
 Here `gre` and `icmp` beat the "raw path" figure because that raw number is a
 plain-TCP download, which this ISP **polices** — GRE and ICMP aren't policed, so
-they expose the link's real line rate. TCP is 5-tuple-poisoned and UDP is
-blocked, so a single `tcp` or `udp` tunnel is useless here while `gre` wins by
-far. On a *different* ISP the winner might be `udp` or `mux` — which is the
-whole point of benchmarking. Re-run it from the menu any time conditions change.
+they expose the link's real line rate. TCP is 5-tuple-poisoned and plain UDP is
+rate-crushed, so a single `tcp` or `udp` tunnel is nearly useless here. The
+interesting result is `hysteria`: the same policed UDP path that limits the
+plaintext `udp` tunnel to **3.8 Mbit** carries **~100 Mbit** under Hysteria's
+Brutal congestion control — the fastest of the *fully obfuscated* transports on
+this ISP, and indistinguishable from HTTP/3. `gre`/`icmp` are faster still but
+are recognisable protocols; when stealth matters, `hysteria` is the sweet spot.
+On a *different* ISP the winner might be `udp` or `mux` — which is the whole
+point of benchmarking. Re-run it from the menu any time conditions change.
+
+> These are real measurements taken end-to-end through the manager on two
+> different Iran servers (one auto-provisioned over SSH, one set up with the
+> no-SSH paste token) to the same foreign box.
 
 ---
 
@@ -203,10 +214,16 @@ omnitun udp  ...     omnitun tcp  ...     omnitun icmp ...
 ## Architecture
 
 - **One static core binary** (`omnitun`) — a busybox-style multi-call program
-  that dispatches to `udp` / `tcp` / `mux` / `icmp`. No shared-library
+  that dispatches to `udp` / `tcp` / `mux` / `ws` / `icmp`. No shared-library
   dependencies: crypto is vendored ([Monocypher](https://monocypher.org),
   XChaCha20-Poly1305), so it builds and cross-compiles trivially and runs on
   any modern Linux kernel.
+- **Bundled `hysteria` engine** — the `hysteria` transport is powered by the
+  upstream [Hysteria2](https://github.com/apernet/hysteria) static binary,
+  shipped in [`bin/`](bin/) for both CPUs. The manager generates its YAML
+  (salamander obfs + website masquerade + self-signed TLS), runs it under
+  systemd, and maps OmniTunnel port-forwards onto Hysteria's native
+  TCP/UDP forwarding. No tun device or iptables DNAT is used for this type.
 - Prebuilt for **amd64** and **arm64** under [`bin/`](bin/), also attached to
   each release.
 - **`omnitunnel.sh`** — the English TUI manager: benchmark, instance

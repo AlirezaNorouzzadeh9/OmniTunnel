@@ -1,10 +1,10 @@
 #!/bin/bash
-# OmniTunnel installer - fetches the repo, drops the right prebuilt core binary
+# OmniTunnel installer - fetches the repo, drops the right prebuilt binaries
 # for this CPU, and installs the manager. No compiler required.
-#   curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/icmptun/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh | bash
 set -euo pipefail
-REPO="https://github.com/Free-Guy-IR/icmptun"
-RAW="https://raw.githubusercontent.com/Free-Guy-IR/icmptun/main"
+REPO="https://github.com/Free-Guy-IR/OmniTunnel"
+RAW="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
 DEST="/opt/omnitunnel"
 BINLINK="/usr/local/bin/omnitunnel"
 
@@ -26,21 +26,27 @@ elif command -v yum >/dev/null; then
 fi
 
 mkdir -p "$DEST/bin"
-# prefer a local checkout (git clone), else download the needed files
+# prefer a local checkout (git clone), else download the needed files. The
+# hysteria engine ships too (its own static binary), so the 'hysteria' transport
+# works even where GitHub is unreachable at runtime.
 if [[ -f "$(dirname "$0")/bin/omnitun-$ARCH" ]]; then
     SRC="$(cd "$(dirname "$0")" && pwd)"
     cp "$SRC/bin/omnitun-$ARCH" "$DEST/bin/omnitun-$ARCH"
     cp "$SRC/omnitunnel.sh" "$DEST/omnitunnel.sh"
+    [[ -f "$SRC/bin/hysteria-$ARCH" ]] && cp "$SRC/bin/hysteria-$ARCH" "$DEST/bin/hysteria-$ARCH"
 else
     echo "downloading core + manager ..."
     curl -fsSL "$RAW/bin/omnitun-$ARCH" -o "$DEST/bin/omnitun-$ARCH"
     curl -fsSL "$RAW/omnitunnel.sh" -o "$DEST/omnitunnel.sh"
+    curl -fsSL "$RAW/bin/hysteria-$ARCH" -o "$DEST/bin/hysteria-$ARCH" || true
 fi
 
 chmod +x "$DEST/bin/omnitun-$ARCH" "$DEST/omnitunnel.sh"
 install -m 0755 "$DEST/bin/omnitun-$ARCH" /usr/local/bin/omnitun
+[[ -f "$DEST/bin/hysteria-$ARCH" ]] && { chmod +x "$DEST/bin/hysteria-$ARCH"; install -m 0755 "$DEST/bin/hysteria-$ARCH" /usr/local/bin/hysteria; }
 ln -sf "$DEST/omnitunnel.sh" "$BINLINK"
 
 echo
 echo "Installed. Core: /usr/local/bin/omnitun ($(/usr/local/bin/omnitun version))"
+[[ -x /usr/local/bin/hysteria ]] && echo "Hysteria engine: $(/usr/local/bin/hysteria version 2>/dev/null | awk -F'\t' '/Version/{print $2}')"
 echo "Run it with:  omnitunnel"
