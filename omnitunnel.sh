@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -39,15 +39,19 @@ HY_MASQ_HOST="www.bing.com"
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
 RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
 
-C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
 C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+C_BLUE=$'\033[34m'; C_MAG=$'\033[35m'; C_WHITE=$'\033[97m'; C_GREY=$'\033[90m'
+C_BGRN=$'\033[92m'; C_BCYN=$'\033[96m'; C_BYEL=$'\033[93m'; C_BRED=$'\033[91m'
+# UI glyphs (fall back gracefully on dumb terminals - they are plain UTF-8)
+G_DOT_ON="●"; G_DOT_OFF="○"; G_ARROW="→"; G_TL="╭"; G_TR="╮"; G_BL="╰"; G_BR="╯"; G_H="─"; G_V="│"
 
-need_root() { [[ $EUID -eq 0 ]] || { echo "must be run as root"; exit 1; }; }
-die() { echo "${C_RED}error:${C_RESET} $*" >&2; exit 1; }
-ok() { echo "${C_GREEN}$*${C_RESET}"; }
-info() { echo "${C_CYAN}$*${C_RESET}"; }
-warn() { echo "${C_YELLOW}$*${C_RESET}"; }
-pause() { echo; read -rp "Press Enter to continue..." _ || true; }
+need_root() { [[ $EUID -eq 0 ]] || { printf '%b✗%b must be run as root\n' "$C_BRED$C_BOLD" "$C_RESET"; exit 1; }; }
+die()  { printf '%b✗%b %s\n' "$C_BRED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
+ok()   { printf '%b✓%b %s\n' "$C_BGRN$C_BOLD" "$C_RESET" "$*"; }
+info() { printf '%b›%b %s\n' "$C_BCYN$C_BOLD" "$C_RESET" "$*"; }
+warn() { printf '%b!%b %s\n' "$C_BYEL$C_BOLD" "$C_RESET" "$*"; }
+pause() { printf '\n  %bpress Enter to continue…%b' "$C_DIM" "$C_RESET"; read -r _ || true; }
 
 arch_tag() { case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) echo unknown;; esac; }
 
@@ -461,20 +465,32 @@ inst_enable() {
 inst_running() { systemctl is-active "$(svc_name "$1")" >/dev/null 2>&1; }
 inst_status() {
     load_inst "$1"
-    local st="stopped" col="$C_RED"; inst_running "$1" && { st="running"; col="$C_GREEN"; }
-    printf "  %-14s %s%-8s%s type=%-4s role=%-6s %s -> %s%s  dev=%s\n" \
-        "$1" "$col" "$st" "$C_RESET" "$TYPE" "$ROLE" "$LOCAL_IP" "$PEER_IP" \
-        "$([[ -n "$PORT" && "$TYPE" != icmp ]] && echo ":$PORT")" "$DEV"
-    if ip link show "$DEV" >/dev/null 2>&1; then
-        local out loss rtt
-        out=$(ping -c2 -W2 "$PEER_ADDR" 2>/dev/null || true)
-        loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
-        [[ -n "$rtt" ]] && printf "                 up, peer rtt %s ms, loss %s%%\n" "$rtt" "${loss:-?}" || printf "                 interface up\n"
-        if [[ "$TYPE" == tcp || "$TYPE" == mux ]]; then
-            printf "                 established links: %s\n" "$(ss -tn state established 2>/dev/null | grep -c ":$PORT" || echo 0)"
-        fi
-    fi
+    local running=0; inst_running "$1" && running=1
+    local dot col; if [[ $running == 1 ]]; then dot="$G_DOT_ON"; col="$C_BGRN"; else dot="$G_DOT_OFF"; col="$C_GREY"; fi
+    local port=""; [[ -n "$PORT" && "$TYPE" != icmp ]] && port=":$PORT"
+    # identity line: ● name  type  role  local -> peer:port
+    printf '  %b%s%b %b%-13s%b %b%-9s%b %b%-6s%b %s %b%s%b %s%s\n' \
+        "$col" "$dot" "$C_RESET" "$C_BOLD$C_WHITE" "$1" "$C_RESET" \
+        "$C_MAG" "$TYPE" "$C_RESET" "$C_DIM" "$ROLE" "$C_RESET" \
+        "$LOCAL_IP" "$C_CYAN" "$G_ARROW" "$C_RESET" "$PEER_IP" "$port"
+    # detail line: health
+    local detail
+    if [[ $running == 0 ]]; then
+        detail="${C_GREY}stopped${C_RESET}"
+    elif type_is_hysteria "$TYPE"; then
+        local nf; nf=$(grep -c . "$(inst_pf "$1")" 2>/dev/null || echo 0)
+        detail="${C_BGRN}connected${C_RESET}   ${C_DIM}forwards${C_RESET} ${C_WHITE}${nf}${C_RESET}   ${C_DIM}socks${C_RESET} 127.0.0.1:$PORT"
+    elif ip link show "$DEV" >/dev/null 2>&1; then
+        local out loss rtt; out=$(ping -c2 -W2 "$PEER_ADDR" 2>/dev/null || true)
+        loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+' || true)
+        rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}' || true)
+        if [[ -n "$rtt" ]]; then
+            local lc="$C_BGRN"; [[ -n "$loss" && "$loss" -gt 0 ]] && lc="$C_BYEL"
+            detail="${C_BGRN}up${C_RESET}   ${C_DIM}rtt${C_RESET} ${C_WHITE}${rtt}${C_RESET}ms   ${lc}${loss:-?}% loss${C_RESET}"
+            [[ "$TYPE" == tcp || "$TYPE" == mux ]] && detail="$detail   ${C_DIM}links${C_RESET} $(ss -tn state established 2>/dev/null | grep -c ":$PORT" || echo 0)"
+        else detail="${C_GREEN}interface up${C_RESET}"; fi
+    else detail="${C_BYEL}starting...${C_RESET}"; fi
+    printf '     %b%s%b %s\n' "$C_GREY" "$G_V" "$C_RESET" "$detail"
 }
 
 # ------------------------------------------------------------- port fwd -------
@@ -708,6 +724,20 @@ wizard_add_manual() {
 }
 
 # ----------------------------------------------------------- benchmark --------
+# The measurement server (iperf3) MUST be listening on :5599 on the foreign, or
+# every tunnel measures nothing and the table is all-FAIL. Ensure it is up (or
+# report clearly why it can't be) so the user isn't left guessing.
+bench_ensure_iperf() {
+    local h="$1" i
+    for i in 1 2 3; do
+        peer_ssh "$h" "ss -HlntuS 2>/dev/null | grep -q ':5599 ' || ss -lntu 2>/dev/null | grep -q ':5599 '" && return 0
+        peer_ssh "$h" "command -v iperf3 >/dev/null 2>&1 || { apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
+            (systemctl reset-failed tsbench-iperf 2>/dev/null; systemd-run --unit=tsbench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1) \
+              || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 </dev/null &); true" >/dev/null 2>&1 || true
+        sleep 2
+    done
+    peer_ssh "$h" "ss -lntu 2>/dev/null | grep -q ':5599 '"
+}
 bench_run() {
     need_root; ensure_binary
     local fhost fu fp mylip x
@@ -725,10 +755,21 @@ bench_run() {
     peer_ssh "$fhost" "mkdir -p /opt/omnitunnel/bin" || die "cannot reach $fhost"
     peer_scp "$fhost" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
     peer_scp "$fhost" "$SCRIPT_PATH" "/opt/omnitunnel/omnitunnel.sh"
-    peer_ssh "$fhost" "chmod +x /opt/omnitunnel/omnitunnel.sh; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun; command -v iperf3 >/dev/null || (apt-get install -y iperf3 || yum install -y iperf3) >/dev/null 2>&1; (systemctl reset-failed tsbench-iperf 2>/dev/null; systemd-run --unit=tsbench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1) || (pkill -f 'iperf3 -s -p 5599'; setsid iperf3 -s -p 5599 >/dev/null 2>&1 &)" || true
+    peer_ssh "$fhost" "chmod +x /opt/omnitunnel/omnitunnel.sh; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun" >/dev/null 2>&1 || true
     # hysteria engine for the far side too (so its bench server can come up)
     local hbin; hbin="$(hy_local_bin "$parch" || true)"
     [[ -n "$hbin" ]] && { peer_scp "$fhost" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch"; peer_ssh "$fhost" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria" >/dev/null 2>&1 || true; }
+    # bring up (and verify) the iperf3 measurement server on the foreign
+    info "Starting measurement server on $fhost ..."
+    if ! bench_ensure_iperf "$fhost"; then
+        echo
+        warn "Could not start iperf3 on $fhost - the benchmark can't measure without it."
+        echo "  The foreign box needs the 'iperf3' package (it listens on port 5599 during"
+        echo "  the test). Fix it one of these ways, then run the benchmark again:"
+        echo "    - let it auto-install: make sure the foreign box can reach its apt/yum mirrors"
+        echo "    - or install it by hand on the foreign:  ${C_CYAN}apt install -y iperf3${C_RESET}  (or ${C_CYAN}yum install -y iperf3${C_RESET})"
+        die "measurement server unavailable on $fhost"
+    fi
     sleep 1
 
     echo; printf "%b\n" "${C_BOLD}Raw path (no tunnel):${C_RESET}"
@@ -966,9 +1007,15 @@ cmd_uninstall() {
 }
 
 # -------------------------------------------------------------------- menus ---
+# count instances by state for the header strip
+_state_counts() {
+    RUN=0; STOP=0; local n
+    for n in $(list_instances); do inst_running "$n" && RUN=$((RUN+1)) || STOP=$((STOP+1)); done
+}
 banner() {
     clear 2>/dev/null || true
-    echo -e "${C_CYAN}${C_BOLD}"
+    local myip; myip="$(default_local_ip 2>/dev/null)"
+    printf '%b\n' "${C_BCYN}${C_BOLD}"
     cat <<'EOF'
    ___                 _ _____                       _
   / _ \ _ __ ___  _ __ (_)_   _|   _ _ __  _ __   ___| |
@@ -976,60 +1023,102 @@ banner() {
  | |_| | | | | | | | | | | | || |_| | | | | | | |  __/ |
   \___/|_| |_| |_|_| |_|_| |_| \__,_|_| |_|_| |_|\___|_|
 EOF
-    echo -e "${C_RESET}${C_DIM}   OmniTunnel - multi-protocol obfuscated tunnel suite   v$VERSION   ($(arch_tag))${C_RESET}\n"
+    printf '%b' "${C_RESET}"
+    printf '   %bmulti-protocol obfuscated tunnel suite%b   %bv%s%b %b(%s)%b\n' \
+        "$C_DIM$C_ITAL" "$C_RESET" "$C_BOLD$C_WHITE" "$VERSION" "$C_RESET" "$C_GREY" "$(arch_tag)" "$C_RESET"
+    _state_counts
+    printf '   %b%s%b this box %b%s%b   %b%s running%b   %b%s stopped%b\n\n' \
+        "$C_GREY" "$G_DOT_ON" "$C_RESET" "$C_WHITE" "${myip:-?}" "$C_RESET" \
+        "$C_BGRN" "$RUN" "$C_RESET" "$([[ $STOP -gt 0 ]] && printf '%s' "$C_BRED" || printf '%s' "$C_GREY")" "$STOP" "$C_RESET"
 }
+# a section heading used inside the sub-screens
+heading() { printf '%b%s %s%b\n' "$C_BOLD$C_BCYN" "$G_H$G_H" "$1" "$C_RESET"; }
+# a numbered menu item:  key  label  [hint]  [key-colour]
+mitem() {
+    local kc="${4:-$C_BOLD$C_BCYN}"
+    printf '   %b%s%b  %b%-27s%b %b%s%b\n' "$kc" "$1" "$C_RESET" "$C_WHITE" "$2" "$C_RESET" "$C_DIM$C_ITAL" "${3:-}" "$C_RESET"
+}
+prompt() { printf '\n  %b❯%b ' "$C_BCYN$C_BOLD" "$C_RESET"; }
 menu_instances() {
     while true; do
-        banner; echo "${C_BOLD}Instances:${C_RESET}"; local any=0 n
+        banner
+        heading "Tunnels"
+        local any=0 n
         for n in $(list_instances); do inst_status "$n"; any=1; done
-        [[ "$any" == 0 ]] && echo "  ${C_DIM}(none yet)${C_RESET}"
-        echo; echo "  1) Add a tunnel  ${C_DIM}(auto: sets up the foreign side over SSH)${C_RESET}"
-        echo "  2) Add a tunnel  ${C_YELLOW}MANUAL${C_RESET} ${C_DIM}(no SSH - for ISPs that block port 22; paste a token on the foreign)${C_RESET}"
-        echo "  3) Remove a tunnel"; echo "  4) Restart a tunnel"; echo "  5) Live logs"; echo "  0) Back"
-        read -rp "Choice: " c
+        [[ "$any" == 0 ]] && printf '  %b%s none yet%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"
+        echo
+        heading "Manage"
+        mitem 1 "Add a tunnel"        "auto - sets up the foreign over SSH"
+        mitem 2 "Add a tunnel (MANUAL)" "no SSH - paste a token on the foreign"
+        mitem 3 "Remove a tunnel"
+        mitem 4 "Restart a tunnel"
+        mitem 5 "Live logs"
+        mitem 0 "Back"
+        prompt; read -r c
         case "$c" in
             1) wizard_add; pause;;
             2) wizard_add_manual; pause;;
-            3) read -rp "Instance to remove: " n; inst_remove "$n"
-               read -rp "Also remove the far side? [y/N]: " yn
-               if [[ "$yn" =~ ^[Yy] ]]; then read -rp "Foreign IP: " fh; peer_ssh "$fh" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" 2>/dev/null || true; fi; pause;;
-            4) read -rp "Instance: " n; inst_enable "$n"; pause;;
-            5) read -rp "Instance: " n; journalctl -u "$(svc_name "$n")" -n 40 --no-pager 2>/dev/null || true; pause;;
+            3) read -rp "  instance to remove: " n; [[ -z "$n" ]] && continue; inst_remove "$n"
+               read -rp "  also remove the far (foreign) side? [y/N]: " yn
+               if [[ "$yn" =~ ^[Yy] ]]; then read -rp "  foreign IP: " fh; peer_ssh "$fh" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" 2>/dev/null || true; fi; pause;;
+            4) read -rp "  instance to restart: " n; [[ -n "$n" ]] && inst_enable "$n"; pause;;
+            5) read -rp "  instance: " n; [[ -n "$n" ]] && journalctl -u "$(svc_name "$n")" -n 40 --no-pager 2>/dev/null || true; pause;;
             0) return;;
         esac
     done
 }
 menu_pf() {
     while true; do
-        banner; echo "${C_BOLD}Port forwarding${C_RESET}  (a port hit here is tunneled to the far side)"; local n pf
-        for n in $(list_instances); do pf="$(inst_pf "$n")"; echo "  ${C_CYAN}$n${C_RESET}:"; [[ -s "$pf" ]] && sed 's/^/      /' "$pf" || echo "      (none)"; done
-        echo; echo "  1) Add forward"; echo "  2) Remove forward"; echo "  0) Back"; read -rp "Choice: " c
+        banner
+        heading "Port forwarding  ${C_RESET}${C_DIM}${C_ITAL}(a port hit on this box is tunneled to the far side)${C_RESET}"
+        local n pf any=0
+        for n in $(list_instances); do
+            pf="$(inst_pf "$n")"; any=1
+            printf '  %b%s%b %b%s%b\n' "$C_MAG" "$G_V" "$C_RESET" "$C_BOLD$C_WHITE" "$n" "$C_RESET"
+            if [[ -s "$pf" ]]; then
+                local proto port
+                while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
+                    printf '       %b%s%b %b%-4s%b %s\n' "$C_GREEN" "$G_ARROW" "$C_RESET" "$C_CYAN" "$proto" "$C_RESET" "$port"; done < "$pf"
+            else printf '       %b(no forwards)%b\n' "$C_DIM" "$C_RESET"; fi
+        done
+        [[ "$any" == 0 ]] && printf '  %b(add a tunnel first)%b\n' "$C_DIM" "$C_RESET"
+        echo
+        heading "Actions"
+        mitem 1 "Add forward"
+        mitem 2 "Remove forward"
+        mitem 0 "Back"
+        prompt; read -r c
         case "$c" in
-            1) read -rp "Instance: " n; read -rp "Proto (tcp/udp/both): " p; read -rp "Port: " po; pf_add "$n" "$p" "$po"; pause;;
-            2) read -rp "Instance: " n; read -rp "Port: " po; pf_del "$n" "$po"; pause;;
+            1) read -rp "  instance: " n; read -rp "  proto (tcp/udp/both): " p; read -rp "  port: " po; [[ -n "$n" && -n "$p" && -n "$po" ]] && pf_add "$n" "$p" "$po"; pause;;
+            2) read -rp "  instance: " n; read -rp "  port: " po; [[ -n "$n" && -n "$po" ]] && pf_del "$n" "$po"; pause;;
             0) return;;
         esac
     done
 }
 menu_main() {
     while true; do
-        banner; local cnt; cnt=$(list_instances | grep -c . || true)
-        echo "  ${C_DIM}active instances: $cnt${C_RESET}"; echo
-        echo "  ${C_BOLD}1)${C_RESET} Benchmark all tunnels & pick the best  ${C_DIM}(auto: SSH to foreign)${C_RESET}"
-        echo "  ${C_BOLD}2)${C_RESET} Benchmark - ${C_YELLOW}MANUAL${C_RESET} ${C_DIM}(no SSH; paste a token on the foreign)${C_RESET}"
-        echo "  ${C_BOLD}3)${C_RESET} Manage tunnels (add / remove / restart)"
-        echo "  ${C_BOLD}4)${C_RESET} Port forwarding"
-        echo "  ${C_BOLD}5)${C_RESET} Show status of everything"
-        echo "  ${C_BOLD}6)${C_RESET} Update OmniTunnel  ${C_DIM}(pull the latest from GitHub)${C_RESET}"
-        echo "  ${C_BOLD}7)${C_RESET} ${C_RED}Uninstall${C_RESET}  ${C_DIM}(remove every tunnel + all files, including this tool)${C_RESET}"
-        echo "  ${C_BOLD}0)${C_RESET} Exit"
-        read -rp "Choice: " c
+        banner
+        heading "Tunnels"
+        local any=0 n
+        for n in $(list_instances); do inst_status "$n"; any=1; done
+        [[ $any == 0 ]] && printf '  %b%s no tunnels yet%b %b- add one from "Manage tunnels"%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET" "$C_DIM$C_ITAL" "$C_RESET"
+        echo
+        heading "Menu"
+        mitem 1 "Benchmark & pick best"  "auto - SSH sets up the foreign"
+        mitem 2 "Benchmark  (MANUAL)"    "no SSH - paste a token on the foreign"
+        mitem 3 "Manage tunnels"         "add / remove / restart / logs"
+        mitem 4 "Port forwarding"        "expose a port through a tunnel"
+        mitem 5 "Status of everything"
+        mitem 6 "Update OmniTunnel"      "pull the latest from GitHub"
+        mitem 7 "Uninstall"              "remove every tunnel + all files" "$C_BOLD$C_BRED"
+        mitem 0 "Exit"
+        prompt; read -r c
         case "$c" in
             1) bench_run; pause;;
             2) local fh mip; read -rp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -rp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
             3) menu_instances;;
             4) menu_pf;;
-            5) banner; for n in $(list_instances); do inst_status "$n"; done; pause;;
+            5) banner; heading "Status"; local a5=0; for n in $(list_instances); do inst_status "$n"; a5=1; done; [[ "$a5" == 0 ]] && printf '  %b%s no tunnels%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"; pause;;
             6) if cmd_update; then ok "Reloading the updated manager..."; sleep 1; exec "$SCRIPT_PATH" menu; else pause; fi;;
             7) cmd_uninstall; pause;;
             0) exit 0;;
