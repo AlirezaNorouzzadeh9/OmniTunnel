@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.4"
+VERSION="2.4.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -491,15 +491,22 @@ inst_status() {
         else detail="${C_GREEN}interface up${C_RESET}"; fi
     else detail="${C_BYEL}starting...${C_RESET}"; fi
     printf '     %b%s%b %s\n' "$C_GREY" "$G_V" "$C_RESET" "$detail"
-    # endpoints line: the tunnel's own local IPs - BOTH ends, shown on the Iran
-    # box: the Iran-side tunnel IP (this box) and the foreign-side tunnel IP.
-    # Labels follow the role (this box is Iran when client, foreign when server).
-    local ir fo
-    if [[ "$ROLE" == server ]]; then ir="$PEER_ADDR"; fo="$TUN_ADDR"; else ir="$TUN_ADDR"; fo="$PEER_ADDR"; fi
-    printf '     %b%s%b %btunnel-ip%b %biran%b %b%-15s%b %bforeign%b %b%s%b\n' \
-        "$C_GREY" "$G_V" "$C_RESET" "$C_DIM" "$C_RESET" \
-        "$C_GREEN" "$C_RESET" "$C_BOLD$C_WHITE" "$ir" "$C_RESET" \
-        "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$fo" "$C_RESET"
+    # endpoints line. tun transports (gre/icmp/udp/tcp/mux/ws) have a real
+    # point-to-point tun interface, so we show its two pingable IPs (Iran side /
+    # foreign side). hysteria has NO L3 tun device - it moves traffic over a QUIC
+    # SOCKS5 + port-forwards - so those 10.x numbers aren't assigned to anything
+    # and would never ping; show its real local access point instead.
+    if type_is_hysteria "$TYPE"; then
+        printf '     %b%s%b %bproxy mode%b %b- no L3 tunnel IP; local access%b %bsocks 127.0.0.1:%s%b %b+ forwarded ports on this box%b\n' \
+            "$C_GREY" "$G_V" "$C_RESET" "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BOLD$C_WHITE" "$PORT" "$C_RESET" "$C_DIM" "$C_RESET"
+    else
+        local ir fo
+        if [[ "$ROLE" == server ]]; then ir="$PEER_ADDR"; fo="$TUN_ADDR"; else ir="$TUN_ADDR"; fo="$PEER_ADDR"; fi
+        printf '     %b%s%b %btunnel-ip%b %biran%b %b%-15s%b %bforeign%b %b%s%b   %b(pingable)%b\n' \
+            "$C_GREY" "$G_V" "$C_RESET" "$C_DIM" "$C_RESET" \
+            "$C_GREEN" "$C_RESET" "$C_BOLD$C_WHITE" "$ir" "$C_RESET" \
+            "$C_CYAN" "$C_RESET" "$C_BOLD$C_WHITE" "$fo" "$C_RESET" "$C_DIM" "$C_RESET"
+    fi
 }
 
 # ------------------------------------------------------------- port fwd -------
