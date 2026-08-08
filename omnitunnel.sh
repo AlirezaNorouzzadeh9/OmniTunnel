@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -167,12 +167,16 @@ hy_cert() {
         -days 3650 -nodes -subj "/CN=$HY_MASQ_HOST" >/dev/null 2>&1 || die "openssl needed for hysteria cert"
     chmod 600 "$d/hy.key"
 }
-# render /etc/omnitunnel/inst/<n>/hy.yaml from instance.conf (+ pf.conf on client)
-hy_write_config() {
-    local n="$1"; load_inst "$n"; local d yaml; d="$(inst_path "$n")"; yaml="$d/hy.yaml"; hy_creds
+# render the hysteria YAML for instance <n> into file <out>.
+# The engine config holds only the transport + a localhost SOCKS5 (always on, so
+# it stays connected before any forward is added) + any UDP forwards. TCP
+# forwards deliberately live OUTSIDE the engine (see relays below) so that
+# adding/removing one never restarts the engine or disturbs the QUIC session.
+hy_render_config() {
+    local n="$1" out="$2"; load_inst "$n"; local d; d="$(inst_path "$n")"; hy_creds
     if [[ "$ROLE" == server ]]; then
         hy_cert "$d"
-        cat > "$yaml" <<EOF
+        cat > "$out" <<EOF
 listen: :$PORT
 tls:
   cert: $d/hy.crt
@@ -192,7 +196,7 @@ masquerade:
 EOF
     else
         local bw; bw="$(hy_bw "$SHAPE")"
-        cat > "$yaml" <<EOF
+        cat > "$out" <<EOF
 server: $PEER_IP:$PORT
 auth: $HY_AUTH
 tls:
@@ -208,22 +212,152 @@ bandwidth:
 socks5:
   listen: 127.0.0.1:$PORT
 EOF
-        # A localhost SOCKS5 is always present so the engine has a "mode" and
-        # stays connected even before any port-forward is added (and it doubles
-        # as a ready-to-use proxy through the tunnel). Port-forwards add on top.
-        # forwarded ports become native hysteria forwards (server dials 127.0.0.1)
-        local pf tcp_e="" udp_e="" proto port; pf="$(inst_pf "$n")"
+        # UDP forwards can't ride the SOCKS5 relay, so they stay in-config (adding
+        # a UDP forward is the one case that still restarts the engine). TCP
+        # forwards are normally handled by standalone relays and are NOT emitted
+        # here; only the python3-less fallback sets HY_TCP_IN_CONFIG=1.
+        local pf udp_e="" tcp_e="" proto port; pf="$(inst_pf "$n")"
         if [[ -s "$pf" ]]; then
-            while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
+            while IFS=: read -r proto port; do [[ -z "$proto" || -z "$port" ]] && continue
                 local blk="  - listen: 0.0.0.0:$port"$'\n'"    remote: 127.0.0.1:$port"$'\n'
-                [[ "$proto" == tcp ]] && tcp_e+="$blk"
                 [[ "$proto" == udp ]] && udp_e+="$blk"
+                [[ "$proto" == tcp && "${HY_TCP_IN_CONFIG:-0}" == 1 ]] && tcp_e+="$blk"
             done < "$pf"
         fi
-        [[ -n "$tcp_e" ]] && { echo "tcpForwarding:" >> "$yaml"; printf '%s' "$tcp_e" >> "$yaml"; }
-        [[ -n "$udp_e" ]] && { echo "udpForwarding:" >> "$yaml"; printf '%s' "$udp_e" >> "$yaml"; }
+        [[ -n "$tcp_e" ]] && { echo "tcpForwarding:" >> "$out"; printf '%s' "$tcp_e" >> "$out"; }
+        [[ -n "$udp_e" ]] && { echo "udpForwarding:" >> "$out"; printf '%s' "$udp_e" >> "$out"; }
     fi
-    chmod 600 "$yaml"
+    chmod 600 "$out" 2>/dev/null || true
+}
+hy_write_config() { hy_render_config "$1" "$(inst_path "$1")/hy.yaml"; }
+
+# --- zero-disruption TCP forwards: one tiny relay per port, through the SOCKS5 --
+# Each relay listens on 0.0.0.0:<port> and dials 127.0.0.1:<port> (resolved at the
+# far end) via the client's local SOCKS5. It is its own systemd unit, so adding a
+# port starts one relay and touches nothing else; the engine never restarts.
+HY_RELAY="$ASSET_DIR/socksfwd.py"
+hy_relay_unit() { echo "omnitun-$1-pf-$2.service"; }   # <inst> <port>
+hy_write_relay_script() {
+    [[ -f "$HY_RELAY" ]] && return 0
+    mkdir -p "$(dirname "$HY_RELAY")"
+    cat > "$HY_RELAY" <<'PYEOF'
+import sys, socket, struct, threading
+def s5(sh, sp, th, tp):
+    s = socket.create_connection((sh, sp), timeout=10)
+    s.sendall(b"\x05\x01\x00")
+    if s.recv(2) != b"\x05\x00": s.close(); raise IOError("no-auth refused")
+    t = th.encode()
+    s.sendall(b"\x05\x01\x00\x03" + bytes([len(t)]) + t + struct.pack(">H", tp))
+    r = s.recv(4)
+    if len(r) < 2 or r[1] != 0: s.close(); raise IOError("connect refused")
+    a = r[3]
+    s.recv(4+2) if a == 1 else (s.recv(s.recv(1)[0]+2) if a == 3 else s.recv(16+2))
+    return s
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d: break
+            b.sendall(d)
+    except OSError: pass
+    finally:
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+def handle(c, sh, sp, th, tp):
+    try: u = s5(sh, sp, th, tp)
+    except Exception: c.close(); return
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    pipe(u, c)
+    for x in (c, u):
+        try: x.close()
+        except OSError: pass
+def main():
+    lh, lp, sh, sp, th, tp = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5], int(sys.argv[6])
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((lh, lp)); srv.listen(256)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=handle, args=(c, sh, sp, th, tp), daemon=True).start()
+main()
+PYEOF
+    chmod 755 "$HY_RELAY"
+}
+# reconcile the running per-port relays with pf.conf (client side only)
+hy_reconcile_relays() {
+    load_inst "$1"; local pf socksport="$PORT" changed=0; pf="$(inst_pf "$1")"
+    local want=(); if [[ -s "$pf" ]]; then local pr po
+        while IFS=: read -r pr po; do [[ "$pr" == tcp && -n "$po" ]] && want+=("$po"); done < "$pf"; fi
+    hy_write_relay_script
+    # stop relays whose port is no longer wanted
+    local f base port u
+    for f in /etc/systemd/system/omnitun-"$1"-pf-*.service; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"; port="${base#omnitun-$1-pf-}"; port="${port%.service}"
+        if ! printf '%s\n' "${want[@]:-}" | grep -qx "$port"; then
+            systemctl disable --now "$base" >/dev/null 2>&1 || true; rm -f "$f"; changed=1
+        fi
+    done
+    # write units for wanted ports
+    for port in "${want[@]:-}"; do [[ -z "$port" ]] && continue
+        u="$(hy_relay_unit "$1" "$port")"
+        cat > "/etc/systemd/system/$u" <<EOF
+[Unit]
+Description=OmniTunnel hysteria forward $1 tcp/$port
+After=network-online.target $(svc_name "$1")
+Wants=$(svc_name "$1")
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 $HY_RELAY 0.0.0.0 $port 127.0.0.1 $socksport 127.0.0.1 $port
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        changed=1
+    done
+    [[ "$changed" == 1 ]] && systemctl daemon-reload
+    # start only the relays that are not already up (existing ones stay untouched)
+    for port in "${want[@]:-}"; do [[ -z "$port" ]] && continue
+        u="$(hy_relay_unit "$1" "$port")"
+        systemctl enable "$u" >/dev/null 2>&1 || true
+        systemctl is-active --quiet "$u" || systemctl start "$u" >/dev/null 2>&1 || true
+    done
+    return 0
+}
+# tear down all relays for an instance (used on remove)
+hy_remove_relays() {
+    local f base changed=0
+    for f in /etc/systemd/system/omnitun-"$1"-pf-*.service; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"; systemctl disable --now "$base" >/dev/null 2>&1 || true
+        rm -f "$f"; changed=1
+    done
+    [[ "$changed" == 1 ]] && systemctl daemon-reload || true
+    return 0
+}
+# apply pf.conf for a hysteria instance with the least possible disruption:
+# rebuild the engine config and restart ONLY if it actually changed (i.e. a UDP
+# forward was added/removed, or the python3-less TCP fallback is in play); TCP
+# forwards are normally reconciled as standalone relays and never bounce engine.
+hy_pf_reconcile() {
+    load_inst "$1"
+    local have_py=1; command -v python3 >/dev/null 2>&1 || have_py=0
+    local d yaml tmp; d="$(inst_path "$1")"; yaml="$d/hy.yaml"; tmp="$d/hy.yaml.new"
+    if [[ "$ROLE" != server && "$have_py" == 0 ]]; then
+        warn "python3 not found: hysteria TCP forwards stay in-config (engine restarts on change)"
+        HY_TCP_IN_CONFIG=1 hy_render_config "$1" "$tmp"
+    else
+        hy_render_config "$1" "$tmp"
+    fi
+    if ! cmp -s "$tmp" "$yaml" 2>/dev/null; then
+        mv "$tmp" "$yaml"; chmod 600 "$yaml" 2>/dev/null || true
+        inst_running "$1" && systemctl restart "$(svc_name "$1")" 2>/dev/null || true
+    else rm -f "$tmp"; fi
+    [[ "$ROLE" == server ]] && return 0
+    [[ "$have_py" == 1 ]] && hy_reconcile_relays "$1"
+    return 0
 }
 
 # ------------------------------------------------------------- tuning ---------
@@ -345,11 +479,10 @@ inst_status() {
 # ------------------------------------------------------------- port fwd -------
 pf_apply_all() {
     load_inst "$1"
-    # hysteria forwards ports inside its own config, not via iptables: rewrite
-    # the YAML from pf.conf and bounce the service.
+    # hysteria forwards ports outside iptables: TCP via per-port relays (no engine
+    # restart), UDP in-config (restart only if the UDP set changed).
     if type_is_hysteria "$TYPE"; then
-        hy_write_config "$1"
-        inst_running "$1" && systemctl restart "$(svc_name "$1")" 2>/dev/null || true
+        hy_pf_reconcile "$1"
         return 0
     fi
     local pf; pf="$(inst_pf "$1")"; [[ -f "$pf" ]] || return 0
@@ -387,6 +520,7 @@ pf_flush_chain() {
 inst_remove() {
     need_root; inst_exists "$1" || { warn "no such instance: $1"; return 0; }
     load_inst "$1"
+    type_is_hysteria "$TYPE" && hy_remove_relays "$1"
     systemctl disable --now "$(svc_name "$1")" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$(svc_name "$1")"; systemctl daemon-reload 2>/dev/null || true
     pf_flush_chain "$1"; ip link del "$DEV" 2>/dev/null || true
@@ -616,8 +750,8 @@ bench_run() {
         if type_is_hysteria "$t"; then
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '200' '$nc'" >/dev/null 2>&1
             create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" 200 "$nc"
-            echo "tcp:5599" > "$(inst_pf "$name")"
-            inst_enable "$name" >/dev/null 2>&1; sleep 6
+            inst_enable "$name" >/dev/null 2>&1
+            echo "tcp:5599" > "$(inst_pf "$name")"; pf_apply_all "$name" >/dev/null 2>&1; sleep 6
             local hrtt hdl
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
             hdl=$(timeout 25 iperf3 -c 127.0.0.1 -p 5599 -t 6 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')

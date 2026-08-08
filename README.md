@@ -221,9 +221,13 @@ omnitun udp  ...     omnitun tcp  ...     omnitun icmp ...
 - **Bundled `hysteria` engine** — the `hysteria` transport is powered by the
   upstream [Hysteria2](https://github.com/apernet/hysteria) static binary,
   shipped in [`bin/`](bin/) for both CPUs. The manager generates its YAML
-  (salamander obfs + website masquerade + self-signed TLS), runs it under
-  systemd, and maps OmniTunnel port-forwards onto Hysteria's native
-  TCP/UDP forwarding. No tun device or iptables DNAT is used for this type.
+  (salamander obfs + website masquerade + self-signed TLS) and runs it under
+  systemd. The engine keeps an always-on localhost SOCKS5, and each **TCP
+  port-forward is a tiny standalone relay** that dials through that SOCKS5 as
+  its own systemd unit — so adding or removing a forward starts/stops one relay
+  and **never restarts the engine or disturbs the live QUIC session or other
+  forwards** (UDP forwards are the one exception and still live in-config). No
+  tun device or iptables DNAT is used for this type.
 - Prebuilt for **amd64** and **arm64** under [`bin/`](bin/), also attached to
   each release.
 - **`omnitunnel.sh`** — the English TUI manager: benchmark, instance
