@@ -52,13 +52,14 @@ ensure_binary() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux tcp"
+ALL_TYPES="gre icmp udp mux ws tcp"
 type_desc() {
     case "$1" in
         gre)  echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
         icmp) echo "IP-over-ICMP  (blends in as ping; no key)";;
         udp)  echo "IP-over-UDP AEAD  (fastest where UDP is allowed)";;
         mux)  echo "multi-connection TCP  (N links; for UDP-blocking DPI)";;
+        ws)   echo "multi-connection WebSocket  (looks like HTTPS; stealthiest)";;
         tcp)  echo "single TCP AEAD  (looks like one HTTPS connection)";;
         *) echo "";;
     esac
@@ -114,6 +115,7 @@ build_execstart() {
         udp)  echo "$TSUITE_BIN udp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY -T $DEV -M $MTU";;
         tcp)  echo "$TSUITE_BIN tcp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -T $DEV -M $MTU";;
         mux)  echo "$TSUITE_BIN mux -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
+        ws)   echo "$TSUITE_BIN ws -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
         icmp) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag";;
     esac
 }

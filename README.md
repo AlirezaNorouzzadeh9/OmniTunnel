@@ -2,20 +2,20 @@
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
 traffic policing and DPI.** One prebuilt static core binary, one English
-menu-driven manager, five interchangeable tunnel transports, and any
+menu-driven manager, six interchangeable tunnel transports, and any
 many-to-many topology you need.
 
 Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
 police, throttle, or block traffic very differently depending on the transport
 and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
-ICMP is now just one of the five transports.)
+ICMP is now just one of the six transports.)
 
 ---
 
-## Why five transports?
+## Why six transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
-**per-route and per-transport**, and it changes. OmniTunnel ships all five and
+**per-route and per-transport**, and it changes. OmniTunnel ships all six and
 lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
@@ -25,6 +25,7 @@ lets you **benchmark them and keep the winner**:
 | `udp`  | IP-over-UDP, XChaCha20-Poly1305, no header/handshake | UDP is allowed — usually the fastest of the encrypted carriers |
 | `tcp`  | IP-over-TCP, one connection that looks like a long HTTPS session | UDP is blocked but a single TCP stream runs clean |
 | `mux`  | **Multi-connection TCP** — N parallel links, each inner flow pinned to one link | Hostile DPI that blocks UDP *and* poisons long-lived TCP 5-tuples |
+| `ws`   | **Multi-connection WebSocket** — real HTTP `Upgrade` handshake, AEAD payload inside masked WS frames | You need `mux`'s throughput but the carrier must be **indistinguishable from a browser/CDN WebSocket** on 443/80 |
 
 Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
 protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
