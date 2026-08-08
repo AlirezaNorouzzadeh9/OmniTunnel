@@ -197,6 +197,8 @@ omnitunnel status  <instance>
 omnitunnel remove  <instance>        # removes ONLY that instance (both-side safe)
 omnitunnel pf-add  <instance> <tcp|udp|both> <port>
 omnitunnel bench
+omnitunnel update                    # pull the latest from GitHub (see below)
+omnitunnel uninstall                 # remove every tunnel + all files, incl. itself
 ```
 
 The core binary can also be driven directly:
@@ -208,6 +210,30 @@ omnitun udp  ...     omnitun tcp  ...     omnitun icmp ...
 ```
 
 `-s` marks the server (listening) side; the client omits it.
+
+---
+
+## Updating & removing
+
+**Update.** Re-running the one-liner is the update path — it's idempotent and
+version-aware:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh) && omnitunnel
+```
+
+It detects the installed version, refreshes the manager and the core binaries,
+and **only if the version actually changed** restarts the running tunnels so they
+pick up the new core (an unchanged version touches nothing). Or do it from inside
+the tool — main menu → **Update OmniTunnel** — or `omnitunnel update`. A box with
+no direct GitHub egress is updated the same way you first set it up: re-push the
+files from a box that can reach GitHub.
+
+**Uninstall.** Main menu → **Uninstall**, or `omnitunnel uninstall`. It removes
+every tunnel it created (including any leftover `bench-*`), their units, relays,
+tun devices and iptables chains, the core binaries, all state under
+`/etc/omnitunnel`, and finally its own files in `/opt/omnitunnel` and the
+`omnitunnel` command. It never touches anything it didn't create.
 
 ---
 

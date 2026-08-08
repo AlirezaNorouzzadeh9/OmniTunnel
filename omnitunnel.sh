@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.2.2"
+VERSION="2.3.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -28,6 +28,7 @@ ROOT_DIR="/etc/omnitunnel"
 INST_DIR="$ROOT_DIR/inst"
 PEER_DIR="$ROOT_DIR/peers"
 TSUITE_BIN="/usr/local/bin/omnitun"
+BINLINK="/usr/local/bin/omnitunnel"   # the 'omnitunnel' command (symlink to this script)
 # Hysteria2 is a separate Go engine (QUIC/UDP with the loss-agnostic "Brutal"
 # congestion control). We ship its static binary alongside our C core and drive
 # it through generated YAML - it is the stealthiest fast transport (looks like
@@ -895,6 +896,75 @@ cmd_bench_clean() {
     ok "benchmark test tunnels removed."
 }
 
+# ------------------------------------------------------------ self-update -----
+# Re-run the canonical installer from GitHub. It is idempotent and version-aware:
+# it refreshes the manager + core binaries and, only if the version changed,
+# restarts the running tunnels. Returns non-zero (without aborting the menu) if
+# GitHub can't be reached - e.g. a box with no direct egress, which you update by
+# re-pushing the files the same way you first installed it.
+cmd_update() {
+    need_root
+    command -v curl >/dev/null 2>&1 || { warn "curl is required to update"; return 1; }
+    info "Checking GitHub for a newer OmniTunnel (current v$VERSION)..."
+    local tmp; tmp="$(mktemp)"
+    if ! curl -fsSL "$RAW_BASE/install.sh" -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        warn "Could not reach GitHub from this box."
+        warn "If it has no direct internet egress, update it by re-pushing the files"
+        warn "(run the installer on a box that can reach GitHub, or copy them over)."
+        return 1
+    fi
+    bash "$tmp"; local rc=$?; rm -f "$tmp"
+    [[ $rc -eq 0 ]] || { warn "update failed"; return 1; }
+    return 0
+}
+
+# ----------------------------------------------------------- full uninstall ---
+# Remove EVERYTHING this tool created: every instance (including any leftover
+# bench-* ones) with its unit, relays, tun device and iptables chain; the core
+# binaries; all state; and finally its own files and the 'omnitunnel' command.
+# It never touches anything it did not create.
+cmd_uninstall() {
+    need_root
+    echo
+    warn "This completely removes OmniTunnel and everything it created:"
+    echo "  - every tunnel/instance (including any 'bench-*'), its systemd unit,"
+    echo "    port-forward relays, tun device and iptables chain"
+    echo "  - the core binaries: $TSUITE_BIN and $HYSTERIA_BIN"
+    echo "  - all state in $ROOT_DIR and the files in $ASSET_DIR"
+    echo "  - the 'omnitunnel' command itself"
+    echo "  ${C_DIM}(it does not touch anything OmniTunnel didn't create)${C_RESET}"
+    echo
+    local a; read -rp "Type 'DELETE' to remove everything: " a || true
+    [[ "$a" == "DELETE" ]] || { info "aborted - nothing removed."; return 0; }
+    echo
+    # 1) clean removal of each instance the tool knows about
+    local n
+    for n in $(list_instances); do echo "  removing instance '$n'"; inst_remove "$n" >/dev/null 2>&1 || true; done
+    # 2) sweep any stray omnitun-* units (relays, bench iperf, half-removed ones)
+    local u
+    for u in $(systemctl list-units 'omnitun-*' --all --no-legend 2>/dev/null | awk '{print $1}'); do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$u"
+    done
+    systemctl reset-failed 2>/dev/null || true; systemctl daemon-reload 2>/dev/null || true
+    # 3) sweep any leftover TSUITE nat chains
+    local ch
+    for ch in $(iptables -t nat -S 2>/dev/null | grep -oE 'TSUITE_[A-Z0-9_]+' | sort -u); do
+        iptables -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
+        iptables -t nat -F "$ch" 2>/dev/null || true
+        iptables -t nat -X "$ch" 2>/dev/null || true
+    done
+    # 4) core binaries + relay helper
+    rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY"
+    # 5) state, the command symlink, then the install dir (this script lives there)
+    rm -rf "$ROOT_DIR"
+    rm -f "$BINLINK"
+    ok "OmniTunnel removed. Deleting its own files now - goodbye."
+    rm -rf "$ASSET_DIR"
+    exit 0
+}
+
 # -------------------------------------------------------------------- menus ---
 banner() {
     clear 2>/dev/null || true
@@ -950,6 +1020,8 @@ menu_main() {
         echo "  ${C_BOLD}3)${C_RESET} Manage tunnels (add / remove / restart)"
         echo "  ${C_BOLD}4)${C_RESET} Port forwarding"
         echo "  ${C_BOLD}5)${C_RESET} Show status of everything"
+        echo "  ${C_BOLD}6)${C_RESET} Update OmniTunnel  ${C_DIM}(pull the latest from GitHub)${C_RESET}"
+        echo "  ${C_BOLD}7)${C_RESET} ${C_RED}Uninstall${C_RESET}  ${C_DIM}(remove every tunnel + all files, including this tool)${C_RESET}"
         echo "  ${C_BOLD}0)${C_RESET} Exit"
         read -rp "Choice: " c
         case "$c" in
@@ -958,6 +1030,8 @@ menu_main() {
             3) menu_instances;;
             4) menu_pf;;
             5) banner; for n in $(list_instances); do inst_status "$n"; done; pause;;
+            6) if cmd_update; then ok "Reloading the updated manager..."; sleep 1; exec "$SCRIPT_PATH" menu; else pause; fi;;
+            7) cmd_uninstall; pause;;
             0) exit 0;;
         esac
     done
@@ -984,6 +1058,8 @@ case "${1:-menu}" in
     _postup)          cmd_postup "${2:?}";;
     _peercreate)      shift; cmd_peercreate "$@";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
+    update|upgrade)   need_root; cmd_update;;
+    uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|update|uninstall]";;
 esac
