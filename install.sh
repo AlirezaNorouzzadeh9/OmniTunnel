@@ -23,7 +23,12 @@ case "$(uname -m)" in
 esac
 
 ver_of() { grep -m1 -oE 'VERSION="[0-9.]+"' "$1" 2>/dev/null | grep -oE '[0-9.]+'; }
+sum_of() { [[ -f "$1" ]] && { sha1sum "$1" 2>/dev/null || md5sum "$1" 2>/dev/null || cksum "$1"; } | awk '{print $1}'; }
 OLD_VER="$(ver_of "$DEST/omnitunnel.sh" 2>/dev/null || true)"
+# checksum the installed core binaries BEFORE we overwrite them, so we only
+# restart running tunnels if the core actually changed - a script-only update
+# must not needlessly bounce a production tunnel.
+OLD_CORE="$(sum_of /usr/local/bin/omnitun)"; OLD_HY="$(sum_of /usr/local/bin/hysteria)"
 [[ -n "$OLD_VER" ]] && echo "OmniTunnel: found existing install v$OLD_VER ($ARCH), checking for updates..." \
                     || echo "OmniTunnel installer - CPU arch: $ARCH"
 
@@ -68,22 +73,28 @@ install -m 0755 "$DEST/bin/omnitun-$ARCH" /usr/local/bin/omnitun
 ln -sf "$DEST/omnitunnel.sh" "$BINLINK"
 
 NEW_VER="$(ver_of "$DEST/omnitunnel.sh" || true)"
+NEW_CORE="$(sum_of /usr/local/bin/omnitun)"; NEW_HY="$(sum_of /usr/local/bin/hysteria)"
+core_changed=0; [[ "$OLD_CORE" != "$NEW_CORE" || "$OLD_HY" != "$NEW_HY" ]] && core_changed=1
 
 echo
 if [[ -z "$OLD_VER" ]]; then
     echo "Installed OmniTunnel v${NEW_VER:-?} - core: $(/usr/local/bin/omnitun version 2>/dev/null)"
     [[ -x /usr/local/bin/hysteria ]] && echo "Hysteria engine: $(/usr/local/bin/hysteria version 2>/dev/null | awk -F'\t' '/Version/{print $2}')"
     echo "Run it with:  omnitunnel"
-elif [[ "$OLD_VER" == "$NEW_VER" ]]; then
+elif [[ "$OLD_VER" == "$NEW_VER" && "$core_changed" == 0 ]]; then
     echo "Already up to date (v$NEW_VER). Nothing changed; running tunnels left untouched."
 else
-    echo "Updated OmniTunnel  v$OLD_VER  ->  v$NEW_VER"
-    # New core binaries are in place; restart the running tunnels so they pick
-    # them up. (Port-forward relays don't use the core binary, so skip them.)
-    changed=0
-    for u in $(systemctl list-units 'omnitun-*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
-        case "$u" in *-pf-*.service) continue;; esac
-        echo "  restarting $u"; systemctl restart "$u" 2>/dev/null || true; changed=1
-    done
-    [[ "$changed" == 1 ]] && echo "Running tunnels restarted on the new version." || echo "No running tunnels to restart."
+    [[ "$OLD_VER" == "$NEW_VER" ]] && echo "Refreshed OmniTunnel (v$NEW_VER)" || echo "Updated OmniTunnel  v$OLD_VER  ->  v$NEW_VER"
+    if [[ "$core_changed" == 1 ]]; then
+        # the core binary actually changed - restart running tunnels to pick it up.
+        # (Port-forward relays don't use the core binary, so skip them.)
+        changed=0
+        for u in $(systemctl list-units 'omnitun-*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
+            case "$u" in *-pf-*.service) continue;; esac
+            echo "  restarting $u"; systemctl restart "$u" 2>/dev/null || true; changed=1
+        done
+        [[ "$changed" == 1 ]] && echo "Core updated - running tunnels restarted." || echo "Core updated - no running tunnels to restart."
+    else
+        echo "Manager/installer refreshed only; core unchanged, so running tunnels were left untouched."
+    fi
 fi
