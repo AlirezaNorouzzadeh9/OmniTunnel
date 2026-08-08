@@ -2,17 +2,17 @@
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
 traffic policing and DPI.** One prebuilt static core binary, one English
-menu-driven manager, four interchangeable tunnel transports, and any
+menu-driven manager, five interchangeable tunnel transports, and any
 many-to-many topology you need.
 
 Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
 police, throttle, or block traffic very differently depending on the transport
 and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
-ICMP is now just one of the four transports.)
+ICMP is now just one of the five transports.)
 
 ---
 
-## Why four transports?
+## Why five transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
 **per-route and per-transport**, and it changes. OmniTunnel ships all four and
@@ -83,24 +83,32 @@ From the main menu choose **“Benchmark all tunnels & pick the best.”** Point
 at a foreign server (IP + SSH login) and it will:
 
 1. measure the **raw** path (download + rtt),
-2. bring up each of the four tunnels in turn and measure **download, packet
+2. bring up each of the five tunnels in turn and measure **download, packet
    loss and ping** through it,
 3. print a comparison table,
 4. **remove every test tunnel from both sides**, then let you keep exactly one
    as a permanent instance.
 
+Real numbers from a heavily-filtered Iran ISP (to one foreign box):
+
 ```
 ==================== BENCHMARK RESULTS ====================
-  raw path : download 180 Mbits/sec , rtt 38 ms
+  raw path : download 180 Mbits/sec (plain TCP - policed) , rtt 40 ms
   TYPE   DOWNLOAD(tunnel)   LOSS    PING(ms)
-  udp    9.2 Mbits/sec      23%     41
-  mux    88  Mbits/sec      0%      40
-  tcp    11  Mbits/sec      0%      39
-  icmp   6.4 Mbits/sec      1%      44
+  gre    652 Mbits/sec      0%      40
+  icmp   350 Mbits/sec      0%      40
+  mux    87  Mbits/sec      0%      40
+  udp    3.8 Mbits/sec      23%     41
+  tcp    1.2 Mbits/sec      0%      86
 ===========================================================
 ```
 
-You can re-run the benchmark from the menu any time conditions change.
+Here `gre` and `icmp` beat the "raw path" figure because that raw number is a
+plain-TCP download, which this ISP **polices** — GRE and ICMP aren't policed, so
+they expose the link's real line rate. TCP is 5-tuple-poisoned and UDP is
+blocked, so a single `tcp` or `udp` tunnel is useless here while `gre` wins by
+far. On a *different* ISP the winner might be `udp` or `mux` — which is the
+whole point of benchmarking. Re-run it from the menu any time conditions change.
 
 ---
 
