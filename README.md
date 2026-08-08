@@ -20,10 +20,19 @@ lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
 |------|------------|-----------|
-| `udp`  | IP-over-UDP, XChaCha20-Poly1305, no header/handshake | UDP is allowed — usually the fastest, closest to raw |
+| `gre`  | IP-over-GRE, native kernel tunnel (no key) | The ISP polices TCP/UDP but leaves protocol-47 alone — often **full line-rate** |
+| `icmp` | IP-over-ICMP, blends in as ping (no key) | Only ICMP passes untouched — frequently unpoliced too |
+| `udp`  | IP-over-UDP, XChaCha20-Poly1305, no header/handshake | UDP is allowed — usually the fastest of the encrypted carriers |
 | `tcp`  | IP-over-TCP, one connection that looks like a long HTTPS session | UDP is blocked but a single TCP stream runs clean |
 | `mux`  | **Multi-connection TCP** — N parallel links, each inner flow pinned to one link | Hostile DPI that blocks UDP *and* poisons long-lived TCP 5-tuples |
-| `icmp` | IP-over-ICMP, blends in as ping (no key) | Only ICMP passes untouched |
+
+Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
+protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
+one heavily-filtered Iran ISP tested, TCP/UDP were crushed to ~1 Mbit while
+**GRE ran at ~650 Mbit and ICMP at ~350 Mbit** to the same foreign box. That is
+exactly why you benchmark first and keep the winner. `gre`/`icmp` are plaintext
+carriers (the inner proxy traffic is already encrypted); `udp`/`tcp`/`mux` add
+their own XChaCha20-Poly1305.
 
 The `mux` transport is the headline. On an ISP that blocks UDP and drops ~half
 of new TCP handshakes, a naive single TCP tunnel melts down to a fraction of

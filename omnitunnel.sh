@@ -52,17 +52,21 @@ ensure_binary() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="udp mux tcp icmp"
+ALL_TYPES="gre icmp udp mux tcp"
 type_desc() {
     case "$1" in
+        gre)  echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
+        icmp) echo "IP-over-ICMP  (blends in as ping; no key)";;
         udp)  echo "IP-over-UDP AEAD  (fastest where UDP is allowed)";;
         mux)  echo "multi-connection TCP  (N links; for UDP-blocking DPI)";;
         tcp)  echo "single TCP AEAD  (looks like one HTTPS connection)";;
-        icmp) echo "IP-over-ICMP  (blends in as ping; no key)";;
         *) echo "";;
     esac
 }
-type_uses_key() { [[ "$1" != icmp ]]; }
+# gre and icmp are kernel/plaintext carriers - no PSK
+type_uses_key() { [[ "$1" != icmp && "$1" != gre ]]; }
+# gre is a native kernel tunnel - no compiled core binary involved
+type_is_kernel() { [[ "$1" == gre ]]; }
 
 # ------------------------------------------------------------ instance i/o ----
 inst_path() { echo "$INST_DIR/$1"; }
@@ -138,11 +142,34 @@ apply_tuning() {
 
 # --------------------------------------------------- systemd unit + enable ----
 write_service() {
-    load_inst "$1"; ensure_binary
+    load_inst "$1"
+    type_is_kernel "$TYPE" || ensure_binary
     local unit="/etc/systemd/system/$(svc_name "$1")"
-    cat > "$unit" <<EOF
+    if type_is_kernel "$TYPE"; then
+        # GRE (or other native kernel carrier): configured on start, removed on
+        # stop. PORT doubles as the GRE key so several GRE tunnels can share an
+        # endpoint pair without colliding. No compiled core binary involved.
+        cat > "$unit" <<EOF
 [Unit]
-Description=tunnelsuite $TYPE instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
+Description=OmniTunnel $TYPE instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'modprobe ip_gre 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type gre local $LOCAL_IP remote $PEER_IP ttl 255 key $PORT; ip addr add $TUN_ADDR peer $PEER_ADDR dev $DEV; ip link set $DEV up mtu $MTU'
+ExecStartPost=$SCRIPT_PATH _postup $1
+ExecStop=-/sbin/ip link del $DEV
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+        cat > "$unit" <<EOF
+[Unit]
+Description=OmniTunnel $TYPE instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
 After=network-online.target
 Wants=network-online.target
 
@@ -158,6 +185,7 @@ TimeoutStopSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi
     systemctl daemon-reload
 }
 cmd_postup() { load_inst "$1"; apply_tuning "$DEV" "$SHAPE"; pf_apply_all "$1" || true; }
@@ -250,23 +278,23 @@ save_peer() {
     { printf 'PEER_USER=%s\nPEER_PASS=%s\n' "$2" "$3"; [[ -n "${4:-}" ]] && printf 'PEER_PROXY=%s\n' "$4"; } > "$(peer_conf "$1")"
     chmod 600 "$(peer_conf "$1")"
 }
-_peer_creds() { PEER_USER=root; PEER_PASS=""; PEER_PROXY=""; local f; f="$(peer_conf "$1")"; [[ -f "$f" ]] && source "$f"; }
+_peer_creds() { PEER_USER=root; PEER_PASS=""; PEER_PROXY=""; local f; f="$(peer_conf "$1")"; [[ -f "$f" ]] && source "$f"; return 0; }
 # Provisioning SSH: don't let a stale/changed host key block automation
 # (servers get reinstalled and their keys rotate). We authenticate with a
 # password or an ssh key, not TOFU. An optional saved SOCKS5 proxy routes the
 # provisioning SSH/SCP around an ISP that blocks the foreign box's port 22 -
 # this only affects the outbound connection we make, never any server's sshd.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15)
-_proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] && PROXY_OPTS=(-o "ProxyCommand=nc -X 5 -x $PEER_PROXY %h %p"); }
+_proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] && PROXY_OPTS=(-o "ProxyCommand=nc -X 5 -x $PEER_PROXY %h %p"); return 0; }
 peer_ssh() { local h="$1"; shift; _peer_creds "$h"; _proxy_opts
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$PEER_USER@$h" "$@"
-    else ssh "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$PEER_USER@$h" "$@"; fi
+        sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"
+    else ssh "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"; fi
 }
 peer_scp() { local h="$1" s="$2" d="$3"; _peer_creds "$h"; _proxy_opts
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$s" "$PEER_USER@$h:$d"
-    else scp "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$s" "$PEER_USER@$h:$d"; fi
+        sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"
+    else scp "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"; fi
 }
 
 # push the manager + the peer's own-arch binary, then bring up the server side
@@ -300,7 +328,7 @@ cmd_add_auto() {
     inst_exists "$kn" && die "instance $kn exists"
     [[ -n "${OMNITUN_PEER_PASS:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "$OMNITUN_PEER_PASS"
     local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$t" == icmp ]] && key=""
+    port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost"
@@ -318,7 +346,7 @@ cmd_add_manual() {
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
     inst_exists "$kn" && die "instance $kn exists"
     local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$t" == icmp ]] && key=""
+    port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
@@ -458,7 +486,7 @@ bench_run() {
     read -rp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
     local nc=16 shape=none
     [[ "$keep" == mux ]] && { read -rp "mux links N [16]: " nc; nc="${nc:-16}"; read -rp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
-    local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$keep" == icmp ]] && key=""
+    local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$keep" == icmp || "$keep" == gre ]] && key=""
     provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "kept '$keep' as instance '$kn' on both sides."
