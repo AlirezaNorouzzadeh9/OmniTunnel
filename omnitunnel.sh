@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -732,14 +732,18 @@ bench_run() {
 
     echo; printf "%b\n" "${C_BOLD}Raw path (no tunnel):${C_RESET}"
     local raw_dl raw_ping
-    raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
+    raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 5 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 5 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; fi
     printf "  download %s   rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
 
     echo; printf "%b\n" "${C_BOLD}Benchmarking each tunnel (a few minutes)...${C_RESET}"
     local rows=() base; base=$(next_subnet_idx); local i=0 t
+    # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
+    # that times out, a far-side bring-up hiccup) must NOT abort the whole run
+    # under 'set -e'. Relax it for the loop; each type just records FAIL instead.
+    set +e
     for t in $ALL_TYPES; do
         local name="bench-$t" sub=$((base+i)); i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
@@ -773,6 +777,7 @@ bench_run() {
         inst_remove "$name" >/dev/null 2>&1
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
     done
+    set -e
 
     echo; printf "%b\n" "${C_BOLD}${C_CYAN}==================== BENCHMARK RESULTS ====================${C_RESET}"
     printf "  raw path : download %s , rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
@@ -785,7 +790,7 @@ bench_run() {
     echo "Keep one as a permanent instance?"
     local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
-    read -rp "Choice: " ch; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
+    read -rp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
     read -rp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
     local nc=16 shape=none
@@ -818,12 +823,13 @@ cmd_bench_manual() {
     echo "   ${C_CYAN}omnitunnel bench-server $token${C_RESET}"
     read -rp "2) Press Enter here once it prints 'benchmark server ready'... " _
     local raw_dl raw_ping
-    raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
+    raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 5 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 5 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; fi
     echo; printf "%b\n" "${C_BOLD}Measuring each tunnel...${C_RESET}"
     local rows=() i=0 t
+    set +e   # best-effort measurement (see bench_run): never abort mid-run
     for t in $ALL_TYPES; do
         type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench (fixed keys) skips hysteria; use auto bench for it
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
@@ -840,6 +846,7 @@ cmd_bench_manual() {
         inst_remove "$name" >/dev/null 2>&1
         i=$((i+1))
     done
+    set -e
     echo; printf "%b\n" "${C_BOLD}${C_CYAN}==================== BENCHMARK RESULTS ====================${C_RESET}"
     printf "  raw path : download %s , rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
     printf "  %b%-6s %-18s %-7s %-9s%b\n" "$C_BOLD" "TYPE" "DOWNLOAD(tunnel)" "LOSS" "PING(ms)" "$C_RESET"
@@ -850,7 +857,7 @@ cmd_bench_manual() {
     echo "Keep one as a permanent instance? (sets up its own fresh token)"
     local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
-    read -rp "Choice: " ch; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
+    read -rp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
     read -rp "Name for the kept instance [main]: " kn; kn="${kn:-main}"
     local nc=16 shape=none
@@ -868,6 +875,7 @@ cmd_bench_server() {
     systemctl reset-failed omnitun-bench-iperf 2>/dev/null || true
     systemd-run --unit=omnitun-bench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1 || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 &)
     local i=0 t
+    set +e   # best-effort bring-up: don't abort if one type fails to come up
     for t in $ALL_TYPES; do
         type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench skips hysteria (fixed-key token path)
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
@@ -877,6 +885,7 @@ cmd_bench_server() {
         inst_enable "$name" >/dev/null 2>&1
         i=$((i+1))
     done
+    set -e
     ok "benchmark server ready - now press Enter on the Iran side."
 }
 cmd_bench_clean() {
