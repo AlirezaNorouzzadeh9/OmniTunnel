@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -818,6 +818,11 @@ bench_run() {
         echo "${dl:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
+    done
+    # belt-and-braces: make sure no bench-* survived on either side
+    for t in $ALL_TYPES; do
+        inst_exists "bench-$t" && inst_remove "bench-$t" >/dev/null 2>&1 || true
+        peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove 'bench-$t'" >/dev/null 2>&1 || true
     done
     set -e
 
