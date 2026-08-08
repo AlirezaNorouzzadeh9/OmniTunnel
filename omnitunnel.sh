@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.5"
+VERSION="2.4.6"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -589,7 +589,7 @@ _peer_creds() { PEER_USER=root; PEER_PASS=""; PEER_PROXY=""; local f; f="$(peer_
 # password or an ssh key, not TOFU. An optional saved SOCKS5 proxy routes the
 # provisioning SSH/SCP around an ISP that blocks the foreign box's port 22 -
 # this only affects the outbound connection we make, never any server's sshd.
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15)
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
 _proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] && PROXY_OPTS=(-o "ProxyCommand=nc -X 5 -x $PEER_PROXY %h %p"); return 0; }
 peer_ssh() { local h="$1"; shift; _peer_creds "$h"; _proxy_opts
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
@@ -747,14 +747,23 @@ wizard_add_manual() {
 # report clearly why it can't be) so the user isn't left guessing.
 bench_ensure_iperf() {
     local h="$1" i
+    # fast path: already listening
+    peer_ssh "$h" "timeout 12 sh -c 'ss -lntu 2>/dev/null | grep -q :5599'" && return 0
+    # install iperf3 if missing - HARD-BOUNDED so a held dpkg lock or a slow/broken
+    # mirror can never hang the benchmark for hours (it used to). Non-interactive,
+    # gives up on the lock after 30s and on the whole step after 100s.
+    peer_ssh "$h" "timeout 100 sh -c 'command -v iperf3 >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true'" >/dev/null 2>&1 || true
+    # then start it (each attempt bounded); bail out fast if iperf3 still isn't there
     for i in 1 2 3; do
-        peer_ssh "$h" "ss -HlntuS 2>/dev/null | grep -q ':5599 ' || ss -lntu 2>/dev/null | grep -q ':5599 '" && return 0
-        peer_ssh "$h" "command -v iperf3 >/dev/null 2>&1 || { apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
-            (systemctl reset-failed tsbench-iperf 2>/dev/null; systemd-run --unit=tsbench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1) \
-              || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 </dev/null &); true" >/dev/null 2>&1 || true
-        sleep 2
+        peer_ssh "$h" "timeout 15 sh -c '
+            command -v iperf3 >/dev/null 2>&1 || exit 3
+            ss -lntu 2>/dev/null | grep -q :5599 && exit 0
+            systemctl reset-failed tsbench-iperf 2>/dev/null
+            systemd-run --unit=tsbench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1 || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 </dev/null &)
+            sleep 1; ss -lntu 2>/dev/null | grep -q :5599'" && return 0
+        sleep 1
     done
-    peer_ssh "$h" "ss -lntu 2>/dev/null | grep -q ':5599 '"
+    return 1
 }
 bench_run() {
     need_root; ensure_binary
