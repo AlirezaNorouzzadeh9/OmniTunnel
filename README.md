@@ -95,6 +95,40 @@ You can re-run the benchmark from the menu any time conditions change.
 
 ---
 
+## When the foreign box can't be reached over SSH
+
+Some Iran ISPs block **outbound port 22** (and DNS to GitHub) entirely, so the
+automatic "set up the far side over SSH" step can't run. Two built-in ways
+around it — **neither touches any server's own SSH or port 22:**
+
+**1. Manual mode (no SSH at all).** From the manage menu pick *“Add a tunnel —
+MANUAL”*, or:
+
+```bash
+omnitunnel add-manual mux main <foreign_ip> 16 90mbit
+```
+
+It brings up the near (Iran) side and prints two lines to paste on the foreign
+box (which abroad can reach GitHub fine):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh)
+omnitunnel server-token <token>
+```
+
+The `<token>` carries the key, port and addresses — the tunnel comes straight
+up. No SSH between the two boxes is ever used.
+
+**2. SOCKS5 proxy for provisioning.** If you already have a working SOCKS5 proxy
+on the Iran box, the auto setup can tunnel its SSH/SCP through it (as the
+original icmptun did) — save a peer with a proxy and the manager adds
+`ProxyCommand=nc -X 5 -x host:port` to every provisioning connection.
+
+> The tunnel always uses **its own port** (e.g. 51820), never 22. Installing or
+> running OmniTunnel never changes any server's SSH login or SSH port.
+
+---
+
 ## Topologies (many-to-many)
 
 Each tunnel is an **instance** with its own tun device, systemd unit, subnet,

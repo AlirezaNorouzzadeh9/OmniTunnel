@@ -27,6 +27,7 @@ PEER_DIR="$ROOT_DIR/peers"
 TSUITE_BIN="/usr/local/bin/omnitun"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
+RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
 
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
 C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
@@ -244,21 +245,28 @@ next_port() {
 
 # ------------------------------------------------------------ peer SSH --------
 peer_conf() { echo "$PEER_DIR/$1.conf"; }
-save_peer() { mkdir -p "$PEER_DIR"; chmod 700 "$PEER_DIR"; printf 'PEER_USER=%s\nPEER_PASS=%s\n' "$2" "$3" > "$(peer_conf "$1")"; chmod 600 "$(peer_conf "$1")"; }
-_peer_creds() { PEER_USER=root; PEER_PASS=""; local f; f="$(peer_conf "$1")"; [[ -f "$f" ]] && source "$f"; }
+save_peer() {
+    mkdir -p "$PEER_DIR"; chmod 700 "$PEER_DIR"
+    { printf 'PEER_USER=%s\nPEER_PASS=%s\n' "$2" "$3"; [[ -n "${4:-}" ]] && printf 'PEER_PROXY=%s\n' "$4"; } > "$(peer_conf "$1")"
+    chmod 600 "$(peer_conf "$1")"
+}
+_peer_creds() { PEER_USER=root; PEER_PASS=""; PEER_PROXY=""; local f; f="$(peer_conf "$1")"; [[ -f "$f" ]] && source "$f"; }
 # Provisioning SSH: don't let a stale/changed host key block automation
 # (servers get reinstalled and their keys rotate). We authenticate with a
-# password or an ssh key, not TOFU.
+# password or an ssh key, not TOFU. An optional saved SOCKS5 proxy routes the
+# provisioning SSH/SCP around an ISP that blocks the foreign box's port 22 -
+# this only affects the outbound connection we make, never any server's sshd.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15)
-peer_ssh() { local h="$1"; shift; _peer_creds "$h"
+_proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] && PROXY_OPTS=(-o "ProxyCommand=nc -X 5 -x $PEER_PROXY %h %p"); }
+peer_ssh() { local h="$1"; shift; _peer_creds "$h"; _proxy_opts
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" "$PEER_USER@$h" "$@"
-    else ssh "${SSH_OPTS[@]}" "$PEER_USER@$h" "$@"; fi
+        sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$PEER_USER@$h" "$@"
+    else ssh "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$PEER_USER@$h" "$@"; fi
 }
-peer_scp() { local h="$1" s="$2" d="$3"; _peer_creds "$h"
+peer_scp() { local h="$1" s="$2" d="$3"; _peer_creds "$h"; _proxy_opts
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" "$s" "$PEER_USER@$h:$d"
-    else scp "${SSH_OPTS[@]}" "$s" "$PEER_USER@$h:$d"; fi
+        sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$s" "$PEER_USER@$h:$d"
+    else scp "${SSH_OPTS[@]}" "${PROXY_OPTS[@]}" "$s" "$PEER_USER@$h:$d"; fi
 }
 
 # push the manager + the peer's own-arch binary, then bring up the server side
@@ -298,6 +306,46 @@ cmd_add_auto() {
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost"
 }
 
+# ---------------------------------------------------------- MANUAL mode --------
+# For hostile ISPs where the near box cannot reach the foreign box's SSH at all
+# (e.g. port 22 blocked). NO SSH between the boxes is used: this brings up the
+# near (client) side and prints a single token to paste on the foreign box.
+# It never touches any server's own sshd or port 22.
+# add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
+cmd_add_manual() {
+    need_root; ensure_binary
+    local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}"
+    [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
+    inst_exists "$kn" && die "instance $kn exists"
+    local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
+    port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$t" == icmp ]] && key=""
+    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
+    inst_enable "$kn"
+    # Server-side params (tun IPs swapped). Encoded so it is a single paste.
+    local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" | base64 | tr -d '\n')
+    echo
+    echo "${C_GREEN}${C_BOLD}Near (Iran) side '$kn' is up.${C_RESET}"
+    echo "${C_BOLD}Now run these TWO lines on the FOREIGN server ($fhost):${C_RESET}"
+    echo
+    echo "  ${C_CYAN}bash <(curl -fsSL $RAW_BASE/install.sh)${C_RESET}"
+    echo "  ${C_CYAN}omnitunnel server-token $token${C_RESET}"
+    echo
+    echo "${C_DIM}No SSH is used between the servers, and nothing changes any server's"
+    echo "own SSH login or port 22. The tunnel uses its own port ($port).${C_RESET}"
+}
+# Consume a token on the foreign box to bring up the matching server side.
+cmd_server_token() {
+    need_root; ensure_binary
+    local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid token"
+    local name t fhost mylip port key pta ppa shape nc
+    IFS='|' read -r name t fhost mylip port key pta ppa shape nc <<< "$dec"
+    [[ -n "$name" && -n "$t" ]] || die "invalid token"
+    inst_exists "$name" && die "instance $name already exists"
+    create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc"
+    inst_enable "$name"
+    ok "foreign (server) side '$name' is up: $fhost <- $mylip"
+}
+
 # ------------------------------------------------------------ add wizard ------
 wizard_add() {
     need_root; ensure_binary
@@ -321,6 +369,26 @@ wizard_add() {
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides."
+}
+
+# Manual add: brings up the near side and prints a token to paste on the
+# foreign box. Use it when this box cannot reach the foreign box over SSH.
+wizard_add_manual() {
+    need_root; ensure_binary
+    echo; echo "${C_BOLD}Add a tunnel - MANUAL${C_RESET} ${C_DIM}(no SSH to the foreign; nothing touches port 22)${C_RESET}"
+    local ci=1 types=() t
+    for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    read -rp "Tunnel type [2]: " ch; ch="${ch:-2}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
+    local mylip; mylip="$(default_local_ip)"
+    read -rp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
+    read -rp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
+    read -rp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
+    local nc=16 shape=none
+    if [[ "$t" == mux ]]; then
+        read -rp "Parallel links N [16]: " nc; nc="${nc:-16}"
+        read -rp "Download shaper rate (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
+    fi
+    cmd_add_manual "$t" "$kn" "$fhost" "$nc" "$shape" "$mylip"
 }
 
 # ----------------------------------------------------------- benchmark --------
@@ -412,15 +480,18 @@ menu_instances() {
         banner; echo "${C_BOLD}Instances:${C_RESET}"; local any=0 n
         for n in $(list_instances); do inst_status "$n"; any=1; done
         [[ "$any" == 0 ]] && echo "  ${C_DIM}(none yet)${C_RESET}"
-        echo; echo "  1) Add a tunnel"; echo "  2) Remove a tunnel"; echo "  3) Restart a tunnel"; echo "  4) Live logs"; echo "  0) Back"
+        echo; echo "  1) Add a tunnel  ${C_DIM}(auto: sets up the foreign side over SSH)${C_RESET}"
+        echo "  2) Add a tunnel  ${C_YELLOW}MANUAL${C_RESET} ${C_DIM}(no SSH - for ISPs that block port 22; paste a token on the foreign)${C_RESET}"
+        echo "  3) Remove a tunnel"; echo "  4) Restart a tunnel"; echo "  5) Live logs"; echo "  0) Back"
         read -rp "Choice: " c
         case "$c" in
             1) wizard_add; pause;;
-            2) read -rp "Instance to remove: " n; inst_remove "$n"
+            2) wizard_add_manual; pause;;
+            3) read -rp "Instance to remove: " n; inst_remove "$n"
                read -rp "Also remove the far side? [y/N]: " yn
                if [[ "$yn" =~ ^[Yy] ]]; then read -rp "Foreign IP: " fh; peer_ssh "$fh" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" 2>/dev/null || true; fi; pause;;
-            3) read -rp "Instance: " n; inst_enable "$n"; pause;;
-            4) read -rp "Instance: " n; journalctl -u "$(svc_name "$n")" -n 40 --no-pager 2>/dev/null || true; pause;;
+            4) read -rp "Instance: " n; inst_enable "$n"; pause;;
+            5) read -rp "Instance: " n; journalctl -u "$(svc_name "$n")" -n 40 --no-pager 2>/dev/null || true; pause;;
             0) return;;
         esac
     done
@@ -464,6 +535,8 @@ case "${1:-menu}" in
     bench)            need_root; bench_run;;
     add)              need_root; wizard_add;;
     add-auto)         shift; cmd_add_auto "$@";;
+    add-manual)       shift; cmd_add_manual "$@";;
+    server-token)     need_root; cmd_server_token "${2:?token}";;
     list)             for n in $(list_instances); do inst_status "$n"; done;;
     status)           inst_status "${2:?instance}";;
     enable)           inst_enable "${2:?instance}";;
