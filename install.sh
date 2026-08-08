@@ -28,11 +28,22 @@ OLD_VER="$(ver_of "$DEST/omnitunnel.sh" 2>/dev/null || true)"
                     || echo "OmniTunnel installer - CPU arch: $ARCH"
 
 # deps: iptables, iproute2, iperf3 (benchmark), openssh, sshpass (peer auto-setup), python3 (hysteria relays)
-if command -v apt-get >/dev/null; then
-    apt-get update -qq || true
-    apt-get install -y iproute2 iptables iperf3 openssh-client sshpass ca-certificates curl python3 >/dev/null 2>&1 || true
-elif command -v yum >/dev/null; then
-    yum install -y iproute iptables iperf3 openssh-clients sshpass curl python3 >/dev/null 2>&1 || true
+# Only touch the package manager if something is actually missing - so a routine
+# update (deps already present) never runs apt at all, and a broken *unrelated*
+# third-party repo on the box can't spew "403 / no longer signed" errors into the
+# output. When we do install, apt/yum noise is redirected away.
+missing=0
+for c in ip iptables iperf3 ssh sshpass curl python3; do
+    command -v "$c" >/dev/null 2>&1 || { missing=1; break; }
+done
+if [[ $missing == 1 ]]; then
+    echo "installing dependencies..."
+    if command -v apt-get >/dev/null; then
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get install -y iproute2 iptables iperf3 openssh-client sshpass ca-certificates curl python3 >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null; then
+        yum install -y iproute iptables iperf3 openssh-clients sshpass curl python3 >/dev/null 2>&1 || true
+    fi
 fi
 
 mkdir -p "$DEST/bin"
