@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.1"
+VERSION="2.4.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -539,7 +539,9 @@ inst_remove() {
     load_inst "$1"
     type_is_hysteria "$TYPE" && hy_remove_relays "$1"
     systemctl disable --now "$(svc_name "$1")" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$(svc_name "$1")"; systemctl daemon-reload 2>/dev/null || true
+    rm -f "/etc/systemd/system/$(svc_name "$1")"
+    systemctl reset-failed "$(svc_name "$1")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
+    systemctl daemon-reload 2>/dev/null || true
     pf_flush_chain "$1"; ip link del "$DEV" 2>/dev/null || true
     rm -rf "$(inst_path "$1")"; ok "removed instance '$1'"
 }
