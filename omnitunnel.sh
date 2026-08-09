@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.6"
+VERSION="2.4.7"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -765,6 +765,25 @@ bench_ensure_iperf() {
     done
     return 1
 }
+# A curl-served test file on the foreign (:5598) is the FALLBACK measurement path:
+# when iperf3 can't measure through a tunnel (its control channel is fragile over
+# e.g. the hysteria SOCKS5 relay) but the tunnel is actually up, we download this
+# file through the tunnel instead. Best-effort - needs python3 on the foreign.
+bench_ensure_httpfile() {
+    local h="$1"
+    peer_ssh "$h" "timeout 60 sh -c '
+        command -v python3 >/dev/null 2>&1 || exit 3
+        [ -f /tmp/omnibench.bin ] || fallocate -l 200M /tmp/omnibench.bin 2>/dev/null || dd if=/dev/zero of=/tmp/omnibench.bin bs=1M count=200 2>/dev/null
+        ss -lntu 2>/dev/null | grep -q :5598 && exit 0
+        setsid python3 -m http.server 5598 --directory /tmp >/dev/null 2>&1 </dev/null &
+        sleep 1; ss -lntu 2>/dev/null | grep -q :5598'" >/dev/null 2>&1
+}
+# measure download speed of a URL and print it iperf-style ("NNN Mbits/sec"); empty on failure
+bench_curl_mbps() {
+    local bps; bps=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 "$1" 2>/dev/null || true)
+    [[ -n "$bps" ]] || return 1
+    awk -v b="$bps" 'BEGIN{ m=b*8/1000000; if(m<0.05) exit 1; printf "%.3g Mbits/sec", m }'
+}
 bench_run() {
     need_root; ensure_binary
     local fhost fu fp mylip x
@@ -797,6 +816,7 @@ bench_run() {
         echo "    - or install it by hand on the foreign:  ${C_CYAN}apt install -y iperf3${C_RESET}  (or ${C_CYAN}yum install -y iperf3${C_RESET})"
         die "measurement server unavailable on $fhost"
     fi
+    bench_ensure_httpfile "$fhost" || true   # best-effort curl fallback server
     sleep 1
 
     echo; printf "%b\n" "${C_BOLD}Raw path (no tunnel):${C_RESET}"
@@ -824,10 +844,12 @@ bench_run() {
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '200' '$nc'" >/dev/null 2>&1
             create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" 200 "$nc"
             inst_enable "$name" >/dev/null 2>&1
-            echo "tcp:5599" > "$(inst_pf "$name")"; pf_apply_all "$name" >/dev/null 2>&1; sleep 6
+            printf 'tcp:5599\ntcp:5598\n' > "$(inst_pf "$name")"; pf_apply_all "$name" >/dev/null 2>&1; sleep 6
             local hrtt hdl
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
             hdl=$(timeout 25 iperf3 -c 127.0.0.1 -p 5599 -t 6 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+            # iperf3 is fragile through the hysteria relay - fall back to a curl download
+            [[ -z "$hdl" ]] && hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
             rows+=("$t|${hdl:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
@@ -841,6 +863,9 @@ bench_run() {
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
         dl=$(timeout 20 iperf3 -c "$pa" -p 5599 -t 6 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        # if iperf couldn't measure but the tunnel is actually up (loss < 100),
+        # fall back to a curl download through the tun to the foreign's file server
+        [[ -z "$dl" && "${loss:-100}" != 100 ]] && dl=$(bench_curl_mbps "http://$pa:5598/omnibench.bin")
         rows+=("$t|${dl:-FAIL}|${loss:-100}%|${rtt:-n/a}")
         echo "${dl:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
@@ -851,6 +876,8 @@ bench_run() {
         inst_exists "bench-$t" && inst_remove "bench-$t" >/dev/null 2>&1 || true
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove 'bench-$t'" >/dev/null 2>&1 || true
     done
+    # tear down the foreign measurement helpers (iperf + curl file server)
+    peer_ssh "$fhost" "systemctl stop tsbench-iperf 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
     set -e
 
     echo; printf "%b\n" "${C_BOLD}${C_CYAN}==================== BENCHMARK RESULTS ====================${C_RESET}"
