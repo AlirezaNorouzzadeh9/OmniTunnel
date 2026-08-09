@@ -23,7 +23,9 @@ case "$(uname -m)" in
 esac
 
 ver_of() { grep -m1 -oE 'VERSION="[0-9.]+"' "$1" 2>/dev/null | grep -oE '[0-9.]+'; }
-sum_of() { [[ -f "$1" ]] && { sha1sum "$1" 2>/dev/null || md5sum "$1" 2>/dev/null || cksum "$1"; } | awk '{print $1}'; }
+# echo the checksum, or nothing if the file is missing - and ALWAYS return 0, so a
+# fresh install (no binaries yet) can't trip 'set -e' on the assignment below.
+sum_of() { [[ -f "$1" ]] || return 0; { sha1sum "$1" 2>/dev/null || md5sum "$1" 2>/dev/null || cksum "$1"; } | awk '{print $1}'; }
 OLD_VER="$(ver_of "$DEST/omnitunnel.sh" 2>/dev/null || true)"
 # checksum the installed core binaries BEFORE we overwrite them, so we only
 # restart running tunnels if the core actually changed - a script-only update
