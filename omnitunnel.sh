@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.5.0"
+VERSION="2.5.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -603,6 +603,29 @@ next_port() {
     used=$(grep -hoE 'PORT=[0-9]+' "$INST_DIR"/*/instance.conf 2>/dev/null | grep -oE '[0-9]+' || true)
     while echo "$used" | grep -qx "$cand"; do cand=$((cand+1)); done; echo "$cand"
 }
+# Collision-safe allocation across BOTH this box and the foreign: two different
+# Iran boxes tunnelling to the SAME foreign must never pick the same 10.201.<n>
+# subnet or the same port/GRE-key, or the second one tears the first one down.
+# $1 = space-separated indices/ports already in use ON THE FOREIGN.
+alloc_subnet() {
+    local avoid=" ${1:-} " i n u localused=" "
+    for n in $(list_instances); do
+        u=$(grep -oE 'TUN_ADDR=10\.201\.[0-9]+' "$(inst_conf "$n")" 2>/dev/null | grep -oE '[0-9]+$' || true)
+        [[ -n "$u" ]] && localused+="$u "
+    done
+    for ((i=0; i<250; i++)); do
+        [[ "$localused" == *" $i "* ]] && continue
+        [[ "$avoid"     == *" $i "* ]] && continue
+        echo "$i"; return
+    done
+    echo 0
+}
+alloc_port() {
+    local cand="${1:-51820}" avoid=" ${2:-} " localused
+    localused=" $(grep -hoE 'PORT=[0-9]+' "$INST_DIR"/*/instance.conf 2>/dev/null | grep -oE '[0-9]+' | tr '\n' ' ') "
+    while [[ "$localused" == *" $cand "* || "$avoid" == *" $cand "* ]]; do cand=$((cand+1)); done
+    echo "$cand"
+}
 
 # ------------------------------------------------------------ peer SSH --------
 peer_conf() { echo "$PEER_DIR/$1.conf"; }
@@ -687,11 +710,19 @@ cmd_add_auto() {
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
     inst_exists "$kn" && die "instance $kn exists"
     [[ -n "${OMNITUN_PEER_PASS:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "$OMNITUN_PEER_PASS"
-    local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
+    # Ask the foreign what it already runs, so a second Iran box to the SAME foreign
+    # gets its own subnet/port/key (and doesn't reuse a name) instead of clobbering
+    # the first box's tunnel.
+    local fsub fport fnames
+    fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
+    case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
+    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
+    port=$(alloc_port "$((51820+sub))" "$fport"); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
-    inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost"
+    inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost  (subnet 10.201.$sub.0/24, port/key $port)"
 }
 
 # ---------------------------------------------------------- MANUAL mode --------
@@ -758,11 +789,17 @@ wizard_add() {
     elif [[ "$t" == hysteria ]]; then
         read -rp "Brutal-CC target bandwidth in mbps (higher pushes harder through loss) [200]: " shape; shape="${shape:-200}"
     fi
-    local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(next_port $((51820+sub))); key=$(gen_key)
+    # collision-safe allocation vs whatever the foreign already runs (see cmd_add_auto)
+    local fsub fport fnames
+    fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
+    case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - pick a different name"; return;; esac
+    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
+    port=$(alloc_port "$((51820+sub))" "$fport"); key=$(gen_key)
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
-    inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides."
+    inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
 }
 
 # Manual add: brings up the near side and prints a token to paste on the
@@ -945,7 +982,12 @@ bench_run() {
     local nc=16 shape=none
     [[ "$keep" == mux ]] && { read -rp "mux links N [16]: " nc; nc="${nc:-16}"; read -rp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
     [[ "$keep" == hysteria ]] && { read -rp "Brutal-CC target bandwidth mbps [200]: " shape; shape="${shape:-200}"; }
-    local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(next_port $((51820+sub))); key=$(gen_key); [[ "$keep" == icmp || "$keep" == gre ]] && key=""
+    local fsub fport fnames
+    fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
+    case " $fnames " in *" $kn "*) die "the foreign already has an instance named '$kn' - choose a different name";; esac
+    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(alloc_port "$((51820+sub))" "$fport"); key=$(gen_key); [[ "$keep" == icmp || "$keep" == gre ]] && key=""
     provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "kept '$keep' as instance '$kn' on both sides."
@@ -1134,8 +1176,13 @@ banner() {
     clear 2>/dev/null || true
     local crumb="${1:-}" myip; myip="$(default_local_ip 2>/dev/null)"
     _state_counts
-    local fwd=0 n c
-    for n in $(list_instances); do c=$(grep -c . "$(inst_pf "$n")" 2>/dev/null || echo 0); fwd=$((fwd+c)); done
+    local fwd=0 n c pf
+    for n in $(list_instances); do
+        pf="$(inst_pf "$n")"; c=0
+        [[ -s "$pf" ]] && c=$(grep -c . "$pf" 2>/dev/null)
+        [[ "$c" =~ ^[0-9]+$ ]] || c=0
+        fwd=$((fwd+c))
+    done
     if [[ -n "$crumb" ]]; then
         local right; right="${myip:-?} · $(arch_tag)"
         local pad=$(( UI_W - ${#crumb} - ${#right} - 14 )); [[ $pad -lt 1 ]] && pad=1
