@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.7"
+VERSION="2.4.8"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -771,11 +771,14 @@ bench_ensure_iperf() {
 # file through the tunnel instead. Best-effort - needs python3 on the foreign.
 bench_ensure_httpfile() {
     local h="$1"
-    peer_ssh "$h" "timeout 60 sh -c '
+    # run the file server under systemd-run (like iperf) so it survives the SSH
+    # session and the outer timeout - a plain 'setsid ... &' inside sh -c did not.
+    peer_ssh "$h" "timeout 90 sh -c '
         command -v python3 >/dev/null 2>&1 || exit 3
         [ -f /tmp/omnibench.bin ] || fallocate -l 200M /tmp/omnibench.bin 2>/dev/null || dd if=/dev/zero of=/tmp/omnibench.bin bs=1M count=200 2>/dev/null
         ss -lntu 2>/dev/null | grep -q :5598 && exit 0
-        setsid python3 -m http.server 5598 --directory /tmp >/dev/null 2>&1 </dev/null &
+        systemctl reset-failed tsbench-http 2>/dev/null
+        systemd-run --unit=tsbench-http --collect python3 -m http.server 5598 --directory /tmp >/dev/null 2>&1 || (setsid python3 -m http.server 5598 --directory /tmp >/dev/null 2>&1 </dev/null &)
         sleep 1; ss -lntu 2>/dev/null | grep -q :5598'" >/dev/null 2>&1
 }
 # measure download speed of a URL and print it iperf-style ("NNN Mbits/sec"); empty on failure
@@ -877,7 +880,7 @@ bench_run() {
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove 'bench-$t'" >/dev/null 2>&1 || true
     done
     # tear down the foreign measurement helpers (iperf + curl file server)
-    peer_ssh "$fhost" "systemctl stop tsbench-iperf 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
+    peer_ssh "$fhost" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
     set -e
 
     echo; printf "%b\n" "${C_BOLD}${C_CYAN}==================== BENCHMARK RESULTS ====================${C_RESET}"
