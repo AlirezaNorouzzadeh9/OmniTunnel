@@ -51,7 +51,7 @@ die()  { printf '%b✗%b %s\n' "$C_BRED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
 ok()   { printf '%b✓%b %s\n' "$C_BGRN$C_BOLD" "$C_RESET" "$*"; }
 info() { printf '%b›%b %s\n' "$C_BCYN$C_BOLD" "$C_RESET" "$*"; }
 warn() { printf '%b!%b %s\n' "$C_BYEL$C_BOLD" "$C_RESET" "$*"; }
-pause() { printf '\n  %bpress Enter to continue…%b' "$C_DIM" "$C_RESET"; read -r _ || true; }
+pause() { printf '\n  %bPress Enter to continue...%b' "$C_GREY" "$C_RESET"; read -r _ || true; }
 
 arch_tag() { case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) echo unknown;; esac; }
 
@@ -912,7 +912,8 @@ bench_run() {
 
     ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
-    printf '  %bkeep one as a permanent instance%b\n' "$C_WHITE" "$C_RESET"
+    rule_green
+    printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
     local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
     read -rp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
@@ -975,7 +976,8 @@ cmd_bench_manual() {
     ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
     warn "on the FOREIGN server, remove the test tunnels with:  ${C_CYAN}omnitunnel bench-clean${C_RESET}"
     echo
-    printf '  %bkeep one as a permanent instance%b %b(sets up its own fresh token)%b\n' "$C_WHITE" "$C_RESET" "$C_GREY" "$C_RESET"
+    rule_green
+    printf '  %bKeep one as a permanent instance?%b %b(sets up its own fresh token)%b ' "$C_BGRN" "$C_RESET" "$C_GREY" "$C_RESET"
     local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
     read -rp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
@@ -1112,16 +1114,18 @@ banner() {
     local fwd=0 n c
     for n in $(list_instances); do c=$(grep -c . "$(inst_pf "$n")" 2>/dev/null || echo 0); fwd=$((fwd+c)); done
     if [[ -n "$crumb" ]]; then
-        local right left; right="$(arch_tag) · $(id -un) · ${myip:-?}"; left="omnitunnel / $crumb"
-        local pad=$(( UI_W - ${#left} - ${#right} )); [[ $pad -lt 1 ]] && pad=1
-        printf '\n  %bomni%b%btunnel%b %b/%b %b%s%b%*s%b%s%b\n' \
-            "$C_BCYN$C_BOLD" "$C_RESET" "$C_BOLD$C_WHITE" "$C_RESET" \
-            "$C_GREY" "$C_RESET" "$C_WHITE" "$crumb" "$C_RESET" "$pad" "" "$C_GREY" "$right" "$C_RESET"
-        rule
-        printf '  %b%s%b %b%s running%b   %b%s %s stopped%b   %b%s forwards%b\n' \
-            "$C_BGRN" "$G_DOT_ON" "$C_RESET" "$C_WHITE" "$RUN" "$C_RESET" \
-            "$([[ $STOP -gt 0 ]] && printf '%s' "$C_BRED" || printf '%s' "$C_GREY")" "$G_DOT_OFF" "$STOP" "$C_RESET" \
-            "$C_GREY" "$fwd" "$C_RESET"
+        local right; right="${myip:-?} · $(arch_tag)"
+        local pad=$(( UI_W - ${#crumb} - ${#right} - 14 )); [[ $pad -lt 1 ]] && pad=1
+        printf '\n  %bOMNITUNNEL%b  %b%s%b%*s%b%s%b\n' \
+            "$C_BCYN$C_BOLD" "$C_RESET" "$C_WHITE$C_BOLD" "$crumb" "$C_RESET" \
+            "$pad" "" "$C_GREY" "$right" "$C_RESET"
+        rule_amber
+        printf '  %b%-16s%b %b%s running%b, %b%s stopped%b   %b%-10s%b %b%s%b\n' \
+            "$C_BCYN" "Tunnels:" "$C_RESET" \
+            "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")" "$RUN" "$C_RESET" \
+            "$([[ $STOP -gt 0 ]] && printf '%s' "$C_BRED" || printf '%s' "$C_GREY")" "$STOP" "$C_RESET" \
+            "$C_BCYN" "Forwards:" "$C_RESET" "$C_WHITE" "$fwd" "$C_RESET"
+        rule_amber
         return 0
     fi
     printf '%b\n' "$C_BCYN$C_BOLD"
@@ -1147,7 +1151,7 @@ EOF
     return 0
 }
 # a section heading used inside the sub-screens
-heading() { printf '\n  %b%s%b\n' "$C_GREY" "$1" "$C_RESET"; }
+heading() { printf '  %b%s%b\n' "$C_GREY" "$1" "$C_RESET"; }
 # a numbered menu item:  key  label  [hint]  [key-colour]
 mitem() {
     local kc="${4:-$C_BCYN$C_BOLD}"
@@ -1166,6 +1170,7 @@ _gt()   { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
 # obfuscated transport - the distinction the whole run exists to answer.
 bench_table() {
     local r t dl ls pg v max=0 sv=0 stealth="" sorted=() line
+    banner "Benchmark results"
     for r in "${ROWS[@]}"; do
         IFS='|' read -r t dl ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
@@ -1173,7 +1178,7 @@ bench_table() {
         case "$t" in udp|tcp|mux|ws|hysteria) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
-    echo; rule
+    echo
     printf '  %braw path (plain TCP, policed)%b   %b%s%b   rtt %b%s ms%b\n\n' \
         "$C_GREY" "$C_RESET" "$C_WHITE" "${RAW_DL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_PING:-n/a}" "$C_RESET"
     printf '    %b%-9s %-14s %-7s %-6s %s%b\n' "$C_GREY" "TYPE" "DOWNLOAD" "" "LOSS" "PING" "$C_RESET"
@@ -1198,20 +1203,22 @@ bench_table() {
 }
 menu_instances() {
     while true; do
-        banner tunnels
+        banner "Manage tunnels"
         local any=0 n
         echo; inst_header
         for n in $(list_instances); do inst_status "$n"; any=1; done
         for n in $(list_instances); do inst_detail "$n"; done
         [[ "$any" == 0 ]] && printf '  %b%s no tunnels yet - add one below%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"
-        group "MANAGE"
-        mitem 1 "Add a tunnel"          "sets up the foreign over SSH"
-        mitem 2 "Add a tunnel — manual" "no SSH · paste a token abroad"
-        mitem 3 "Remove"                "asks about the far side too"
-        mitem 4 "Restart"
-        mitem 5 "Live logs"             "journalctl, last 40 lines"
-        keyhint "1–5 select    0 back    a tunnel name works wherever a number does"
-        prompt; read -r c
+        echo
+        nitem 1 "Add a tunnel  (auto - sets up the foreign over SSH)" "$C_BGRN$C_BOLD"
+        nitem 2 "Add a tunnel  (manual - paste a token abroad)"       "$C_BCYN$C_BOLD"
+        nitem 3 "Remove a tunnel"                                     "$C_BRED$C_BOLD"
+        nitem 4 "Restart a tunnel"
+        nitem 5 "Live logs"
+        nitem 0 "Back"
+        rule_green
+        printf '  %bEnter your choice [0-5]:%b ' "$C_BGRN" "$C_RESET"
+        read -r c
         case "$c" in
             1) wizard_add; pause;;
             2) wizard_add_manual; pause;;
@@ -1226,7 +1233,7 @@ menu_instances() {
 }
 menu_pf() {
     while true; do
-        banner "port forwarding"
+        banner "Port forwarding"
         heading "a port hit on this box is tunneled to the far side"
         local n pf any=0
         for n in $(list_instances); do
@@ -1239,11 +1246,13 @@ menu_pf() {
             else printf '       %b(no forwards)%b\n' "$C_DIM" "$C_RESET"; fi
         done
         [[ "$any" == 0 ]] && printf '  %b(add a tunnel first)%b\n' "$C_DIM" "$C_RESET"
-        heading "ACTIONS"
-        mitem 1 "Add forward"     "instance · tcp/udp/both · port"
-        mitem 2 "Remove forward"  "instance · port"
-        keyhint "1–2 select    0 back"
-        prompt; read -r c
+        echo
+        nitem 1 "Add a forward     (instance · tcp/udp/both · port)" "$C_BGRN$C_BOLD"
+        nitem 2 "Remove a forward  (instance · port)"                "$C_BRED$C_BOLD"
+        nitem 0 "Back"
+        rule_green
+        printf '  %bEnter your choice [0-2]:%b ' "$C_BGRN" "$C_RESET"
+        read -r c
         case "$c" in
             1) read -rp "  instance: " n; read -rp "  proto (tcp/udp/both): " p; read -rp "  port: " po; [[ -n "$n" && -n "$p" && -n "$po" ]] && pf_add "$n" "$p" "$po"; pause;;
             2) read -rp "  instance: " n; read -rp "  port: " po; [[ -n "$n" && -n "$po" ]] && pf_del "$n" "$po"; pause;;
@@ -1272,7 +1281,7 @@ menu_main() {
             2) local fh mip; read -rp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -rp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
             3) menu_instances;;
             4) menu_pf;;
-            5) banner status; echo; inst_header; local a5=0
+            5) banner "Status of everything"; echo; inst_header; local a5=0
                for n in $(list_instances); do inst_status "$n" full; a5=1; done
                [[ "$a5" == 0 ]] && printf '  %b%s no tunnels%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"; pause;;
             6) if cmd_update; then ok "Reloading the updated manager..."; sleep 1; exec "$SCRIPT_PATH" menu; else pause; fi;;
