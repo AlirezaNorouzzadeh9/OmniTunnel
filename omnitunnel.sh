@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.8"
+VERSION="2.4.9"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -846,13 +846,19 @@ bench_run() {
         if type_is_hysteria "$t"; then
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '200' '$nc'" >/dev/null 2>&1
             create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" 200 "$nc"
-            inst_enable "$name" >/dev/null 2>&1
-            printf 'tcp:5599\ntcp:5598\n' > "$(inst_pf "$name")"; pf_apply_all "$name" >/dev/null 2>&1; sleep 6
-            local hrtt hdl
+            # iperf3 is unreliable through the SOCKS5 relay, so hysteria is measured
+            # with a curl download of the foreign's file server (forwarded here).
+            printf 'tcp:5598\n' > "$(inst_pf "$name")"
+            inst_enable "$name" >/dev/null 2>&1; pf_apply_all "$name" >/dev/null 2>&1
+            # wait (bounded ~30s) until the QUIC tunnel actually carries data before measuring
+            local w hrtt hdl="" sz
+            for w in $(seq 1 15); do
+                sz=$(curl -s -o /dev/null -w '%{size_download}' --max-time 3 "http://127.0.0.1:5598/omnibench.bin" 2>/dev/null || echo 0)
+                [[ "$sz" =~ ^[1-9] ]] && break
+                sleep 2
+            done
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
-            hdl=$(timeout 25 iperf3 -c 127.0.0.1 -p 5599 -t 6 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
-            # iperf3 is fragile through the hysteria relay - fall back to a curl download
-            [[ -z "$hdl" ]] && hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
+            hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
             rows+=("$t|${hdl:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
