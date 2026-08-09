@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.4.9"
+VERSION="2.5.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -578,12 +578,28 @@ next_port() {
 
 # ------------------------------------------------------------ peer SSH --------
 peer_conf() { echo "$PEER_DIR/$1.conf"; }
+# Peer creds are stored base64-encoded and read back by a plain parser (never
+# 'source'd) - so a password with shell-special characters ($ # & ; ` ( ) space
+# quotes ...) is preserved exactly instead of being mangled (or worse, executed).
 save_peer() {
     mkdir -p "$PEER_DIR"; chmod 700 "$PEER_DIR"
-    { printf 'PEER_USER=%s\nPEER_PASS=%s\n' "$2" "$3"; [[ -n "${4:-}" ]] && printf 'PEER_PROXY=%s\n' "$4"; } > "$(peer_conf "$1")"
+    { printf 'PEER_USER=%s\n' "$(printf '%s' "$2" | base64 | tr -d '\n')"
+      printf 'PEER_PASS=%s\n' "$(printf '%s' "$3" | base64 | tr -d '\n')"
+      [[ -n "${4:-}" ]] && printf 'PEER_PROXY=%s\n' "$(printf '%s' "$4" | base64 | tr -d '\n')"
+    } > "$(peer_conf "$1")"
     chmod 600 "$(peer_conf "$1")"
 }
-_peer_creds() { PEER_USER=root; PEER_PASS=""; PEER_PROXY=""; local f; f="$(peer_conf "$1")"; [[ -f "$f" ]] && source "$f"; return 0; }
+_peer_creds() {
+    PEER_USER=root; PEER_PASS=""; PEER_PROXY=""
+    local f line k v; f="$(peer_conf "$1")"; [[ -f "$f" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || continue
+        k="${line%%=*}"; v="$(printf '%s' "${line#*=}" | base64 -d 2>/dev/null)"
+        case "$k" in PEER_USER) PEER_USER="$v";; PEER_PASS) PEER_PASS="$v";; PEER_PROXY) PEER_PROXY="$v";; esac
+    done < "$f"
+    [[ -n "$PEER_USER" ]] || PEER_USER=root
+    return 0
+}
 # Provisioning SSH: don't let a stale/changed host key block automation
 # (servers get reinstalled and their keys rotate). We authenticate with a
 # password or an ssh key, not TOFU. An optional saved SOCKS5 proxy routes the
@@ -1110,17 +1126,20 @@ prompt() { printf '\n  %b❯%b ' "$C_BCYN$C_BOLD" "$C_RESET"; }
 menu_instances() {
     while true; do
         banner
-        heading "Tunnels"
+        _state_counts; local cnt; cnt=$((RUN+STOP))
+        printf '   %b%s TUNNELS%b   %b%s%b %brunning%b   %b%s%b %bstopped%b\n\n' \
+            "$C_DIM$C_BOLD" "$cnt" "$C_RESET" "$C_BGRN" "$RUN" "$C_RESET" "$C_DIM" "$C_RESET" \
+            "$([[ $STOP -gt 0 ]] && printf '%s' "$C_BRED" || printf '%s' "$C_GREY")" "$STOP" "$C_RESET" "$C_DIM" "$C_RESET"
         local any=0 n
-        for n in $(list_instances); do inst_status "$n"; any=1; done
-        [[ "$any" == 0 ]] && printf '  %b%s none yet%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"
-        echo
-        heading "Manage"
-        mitem 1 "Add a tunnel"        "auto - sets up the foreign over SSH"
-        mitem 2 "Add a tunnel (MANUAL)" "no SSH - paste a token on the foreign"
+        for n in $(list_instances); do inst_status "$n"; echo; any=1; done
+        [[ "$any" == 0 ]] && printf '   %b%s no tunnels yet - add one below%b\n\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"
+        group "MANAGE"
+        mitem 1 "Add a tunnel"          "auto - sets up the foreign over SSH"
+        mitem 2 "Add a tunnel (manual)" "no SSH - paste a token on the foreign"
         mitem 3 "Remove a tunnel"
         mitem 4 "Restart a tunnel"
         mitem 5 "Live logs"
+        printf '\n'
         mitem 0 "Back"
         prompt; read -r c
         case "$c" in
@@ -1163,22 +1182,21 @@ menu_pf() {
         esac
     done
 }
+group() { printf '\n   %b%s%b\n' "$C_DIM$C_BOLD" "$1" "$C_RESET"; }
 menu_main() {
     while true; do
         banner
-        heading "Tunnels"
-        local any=0 n
-        for n in $(list_instances); do inst_status "$n"; any=1; done
-        [[ $any == 0 ]] && printf '  %b%s no tunnels yet%b %b- add one from "Manage tunnels"%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET" "$C_DIM$C_ITAL" "$C_RESET"
-        echo
-        heading "Menu"
+        group "MEASURE"
         mitem 1 "Benchmark & pick best"  "auto - SSH sets up the foreign"
-        mitem 2 "Benchmark  (MANUAL)"    "no SSH - paste a token on the foreign"
-        mitem 3 "Manage tunnels"         "add / remove / restart / logs"
+        mitem 2 "Benchmark  (manual)"    "no SSH - paste a token on the foreign"
+        group "TUNNELS"
+        mitem 3 "Manage tunnels"         "list / add / remove / restart / logs"
         mitem 4 "Port forwarding"        "expose a port through a tunnel"
-        mitem 5 "Status of everything"
+        mitem 5 "Status of everything"   "live health of every tunnel"
+        group "MAINTENANCE"
         mitem 6 "Update OmniTunnel"      "pull the latest from GitHub"
         mitem 7 "Uninstall"              "remove every tunnel + all files" "$C_BOLD$C_BRED"
+        printf '\n'
         mitem 0 "Exit"
         prompt; read -r c
         case "$c" in
