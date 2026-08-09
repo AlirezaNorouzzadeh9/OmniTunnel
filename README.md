@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/preview.png" alt="OmniTunnel TUI" width="420">
+</p>
+
 # OmniTunnel
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
