@@ -479,14 +479,21 @@ inst_status() {
     if [[ $running == 1 ]]; then dot="$G_DOT_ON"; col="$C_BGRN"; else dot="$G_DOT_ON"; col="$C_BRED"; fi
     local peer="$PEER_IP"; [[ -n "$PORT" && "$TYPE" != icmp ]] && peer="$PEER_IP:$PORT"
     local rtt="-" loss="-" rc="$C_WHITE" lc="$C_BGRN"
-    if [[ $running == 1 ]] && ! type_is_hysteria "$TYPE" && ip link show "$DEV" >/dev/null 2>&1; then
-        local out l r rn; out=$(ping -c2 -W2 "$PEER_ADDR" 2>/dev/null || true)
-        l=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+' || true)
-        r=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}' || true)
-        if [[ -n "$r" ]]; then
-            rn=$(awk -v x="$r" 'BEGIN{printf "%.0f", x}')
-            rtt="${rn}ms"; [[ "$rn" -ge 150 ]] && rc="$C_BYEL"
-            loss="${l:-0}%"; [[ -n "$l" && "$l" -gt 0 ]] && lc="$C_BYEL"
+    if [[ $running == 1 ]]; then
+        # what to ping: an L3 tunnel has its peer's tunnel IP; hysteria has no
+        # tun device, so measure the path to the foreign box's public IP instead.
+        local target=""
+        if type_is_hysteria "$TYPE"; then target="$PEER_IP"
+        elif ip link show "$DEV" >/dev/null 2>&1; then target="$PEER_ADDR"; fi
+        if [[ -n "$target" ]]; then
+            local out l r rn; out=$(ping -c2 -W2 "$target" 2>/dev/null || true)
+            l=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+' || true)
+            r=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}' || true)
+            if [[ -n "$r" ]]; then
+                rn=$(awk -v x="$r" 'BEGIN{printf "%.0f", x}')
+                rtt="${rn}ms"; [[ "$rn" -ge 150 ]] && rc="$C_BYEL"
+                loss="${l:-0}%"; [[ -n "$l" && "$l" -gt 0 ]] && lc="$C_BYEL"
+            fi
         fi
     fi
     printf '  %b%s%b   %b%-12s%b%b%-12s%b%b%-25s%b%b%-8s%b%b%-5s%b\n' \
