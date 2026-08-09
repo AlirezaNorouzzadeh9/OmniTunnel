@@ -43,6 +43,7 @@ C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
 C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
 C_BLUE=$'\033[34m'; C_MAG=$'\033[35m'; C_WHITE=$'\033[97m'; C_GREY=$'\033[90m'
 C_BGRN=$'\033[92m'; C_BCYN=$'\033[96m'; C_BYEL=$'\033[93m'; C_BRED=$'\033[91m'
+C_BMAG=$'\033[95m'; C_BBLU=$'\033[94m'
 # UI glyphs (fall back gracefully on dumb terminals - they are plain UTF-8)
 G_DOT_ON="●"; G_DOT_OFF="○"; G_ARROW="→"; G_TL="╭"; G_TR="╮"; G_BL="╰"; G_BR="╯"; G_H="─"; G_V="│"
 
@@ -464,53 +465,68 @@ inst_enable() {
 }
 inst_running() { systemctl is-active "$(svc_name "$1")" >/dev/null 2>&1; }
 inst_header() {
-    printf '  %b%-2s %-9s %-9s %-22s %-6s %-5s %s%b\n' \
-        "$C_GREY" "" "NAME" "TYPE" "PEER" "RTT" "LOSS" "DETAIL" "$C_RESET"
+    printf '  %b    %-12s%-12s%-25s%-8s%-5s%b\n' \
+        "$C_BCYN" "NAME" "TYPE" "PEER" "RTT" "LOSS" "$C_RESET"
 }
-# one aligned row per instance:  ● name  type  peer:port  rtt  loss  detail
-# pass "full" as $2 to also print the endpoint line underneath.
+# one aligned row per instance:  ● name  type  peer:port  rtt  loss
+#                                   └─ endpoint / proxy detail
+# name white, type magenta, endpoint cyan; rtt/loss go yellow only when bad,
+# and the dot is red for a dead tunnel. pass "full" as $2 for the └─ line.
 inst_status() {
     load_inst "$1"
     local running=0; inst_running "$1" && running=1
-    local dot col; if [[ $running == 1 ]]; then dot="$G_DOT_ON"; col="$C_BGRN"; else dot="$G_DOT_OFF"; col="$C_GREY"; fi
+    local dot col ncol="$C_BOLD$C_WHITE"
+    if [[ $running == 1 ]]; then dot="$G_DOT_ON"; col="$C_BGRN"; else dot="$G_DOT_ON"; col="$C_BRED"; fi
     local peer="$PEER_IP"; [[ -n "$PORT" && "$TYPE" != icmp ]] && peer="$PEER_IP:$PORT"
-    local rtt="-" loss="-" lc="$C_GREY" detail="" ncol="$C_BOLD$C_WHITE"
-    if [[ $running == 0 ]]; then
-        detail="stopped"; ncol="$C_GREY"
-    elif type_is_hysteria "$TYPE"; then
-        local nf; nf=$(grep -c . "$(inst_pf "$1")" 2>/dev/null || echo 0)
-        detail="socks 127.0.0.1:$PORT · $nf fwd"
-    elif ip link show "$DEV" >/dev/null 2>&1; then
-        local out l r; out=$(ping -c2 -W2 "$PEER_ADDR" 2>/dev/null || true)
+    local rtt="-" loss="-" rc="$C_WHITE" lc="$C_BGRN"
+    if [[ $running == 1 ]] && ! type_is_hysteria "$TYPE" && ip link show "$DEV" >/dev/null 2>&1; then
+        local out l r rn; out=$(ping -c2 -W2 "$PEER_ADDR" 2>/dev/null || true)
         l=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+' || true)
         r=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}' || true)
         if [[ -n "$r" ]]; then
-            rtt="$(awk -v x="$r" 'BEGIN{printf "%.0fms", x}')"; loss="${l:-?}%"
-            lc="$C_BGRN"; [[ -n "$l" && "$l" -gt 0 ]] && lc="$C_BYEL"
-            case "$TYPE" in tcp|mux|ws) detail="$(ss -tn state established 2>/dev/null | grep -c ":$PORT" || echo 0) links";; esac
-        else detail="interface up"; fi
-    else detail="starting…"; fi
-    printf '  %b%s%b %b%-9s%b %b%-9s%b %b%-22s%b %b%-6s%b %b%-5s%b %b%s%b\n' \
+            rn=$(awk -v x="$r" 'BEGIN{printf "%.0f", x}')
+            rtt="${rn}ms"; [[ "$rn" -ge 150 ]] && rc="$C_BYEL"
+            loss="${l:-0}%"; [[ -n "$l" && "$l" -gt 0 ]] && lc="$C_BYEL"
+        fi
+    fi
+    printf '  %b%s%b   %b%-12s%b%b%-12s%b%b%-25s%b%b%-8s%b%b%-5s%b\n' \
         "$col" "$dot" "$C_RESET" "$ncol" "$1" "$C_RESET" \
-        "$C_BCYN" "$TYPE" "$C_RESET" "$C_WHITE" "$peer" "$C_RESET" \
-        "$C_WHITE" "$rtt" "$C_RESET" "$lc" "$loss" "$C_RESET" "$C_GREY" "$detail" "$C_RESET"
+        "$C_BMAG" "$TYPE" "$C_RESET" "$C_BCYN" "$peer" "$C_RESET" \
+        "$rc" "$rtt" "$C_RESET" "$lc" "$loss" "$C_RESET"
     [[ "${2:-}" == full ]] && inst_detail "$1"
     return 0
 }
-# the endpoint line, shown on demand instead of on every row. tun transports
-# (gre/icmp/udp/tcp/mux/ws) have a real point-to-point tun interface, so both
-# pingable IPs are listed. hysteria has NO L3 tun device - it moves traffic over
-# a QUIC SOCKS5 + port-forwards - so its local access point is shown instead.
+# the └─ endpoint line under a tunnel's row. tun transports (gre/icmp/udp/tcp/
+# mux/ws) have a real point-to-point tun interface, so both pingable IPs are
+# listed. hysteria has NO L3 tun device - it moves traffic over a QUIC SOCKS5 +
+# port-forwards - so its local access point is shown instead. a stopped tunnel
+# shows how long ago it was last active.
 inst_detail() {
     load_inst "$1"
+    local running=0; inst_running "$1" && running=1
+    if [[ $running == 0 ]]; then
+        local ts es now d rel=""
+        ts=$(systemctl show "$(svc_name "$1")" -p InactiveEnterTimestamp --value 2>/dev/null)
+        es=$(date -d "$ts" +%s 2>/dev/null || echo "")
+        if [[ -n "$es" && "$es" -gt 0 ]]; then now=$(date +%s); d=$((now-es))
+            if   (( d<60 ));    then rel="just now"
+            elif (( d<3600 ));  then rel="$((d/60))m ago"
+            elif (( d<86400 )); then rel="$((d/3600))h ago"
+            else                     rel="$((d/86400))d ago"; fi
+        fi
+        if [[ -n "$rel" ]]; then printf '     %b└─ stopped · last seen %s%b\n' "$C_GREY" "$rel" "$C_RESET"
+        else printf '     %b└─ stopped%b\n' "$C_GREY" "$C_RESET"; fi
+        return 0
+    fi
     if type_is_hysteria "$TYPE"; then
-        printf '     %b%-9s proxy mode - no L3 tunnel IP · local access socks 127.0.0.1:%s + forwarded ports%b\n' \
-            "$C_GREY" "$1" "$PORT" "$C_RESET"
+        local nf; nf=$(grep -c . "$(inst_pf "$1")" 2>/dev/null || echo 0)
+        printf '     %b└─ socks 127.0.0.1:%s · %s fwd · proxy mode (no L3 IP)%b\n' \
+            "$C_GREY" "$PORT" "$nf" "$C_RESET"
     else
         local ir fo
         if [[ "$ROLE" == server ]]; then ir="$PEER_ADDR"; fo="$TUN_ADDR"; else ir="$TUN_ADDR"; fo="$PEER_ADDR"; fi
-        printf '     %b%-9s %s (iran) ↔ %s (foreign) · pingable · dev %s · role %s%b\n' \
-            "$C_GREY" "$1" "$ir" "$fo" "$DEV" "$ROLE" "$C_RESET"
+        printf '     %b└─ %s (iran) ⇄ %s (foreign) · pingable · %s · %s%b\n' \
+            "$C_GREY" "$ir" "$fo" "$DEV" "$ROLE" "$C_RESET"
     fi
 }
 
@@ -1205,9 +1221,8 @@ menu_instances() {
     while true; do
         banner "Manage tunnels"
         local any=0 n
-        echo; inst_header
-        for n in $(list_instances); do inst_status "$n"; any=1; done
-        for n in $(list_instances); do inst_detail "$n"; done
+        echo; inst_header; rule
+        for n in $(list_instances); do inst_status "$n" full; any=1; done
         [[ "$any" == 0 ]] && printf '  %b%s no tunnels yet - add one below%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"
         echo
         nitem 1 "Add a tunnel  (auto - sets up the foreign over SSH)" "$C_BGRN$C_BOLD"
@@ -1281,7 +1296,7 @@ menu_main() {
             2) local fh mip; read -rp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -rp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
             3) menu_instances;;
             4) menu_pf;;
-            5) banner "Status of everything"; echo; inst_header; local a5=0
+            5) banner "Status of everything"; echo; inst_header; rule; local a5=0
                for n in $(list_instances); do inst_status "$n" full; a5=1; done
                [[ "$a5" == 0 ]] && printf '  %b%s no tunnels%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"; pause;;
             6) if cmd_update; then ok "Reloading the updated manager..."; sleep 1; exec "$SCRIPT_PATH" menu; else pause; fi;;
