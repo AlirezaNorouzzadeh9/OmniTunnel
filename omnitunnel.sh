@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.5.3"
+VERSION="2.5.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -952,7 +952,7 @@ bench_run() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(timeout 20 iperf3 -c "$pa" -p 5599 -t 8 -O 3 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        dl=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
         # if iperf couldn't measure but the tunnel is actually up (loss < 100),
         # fall back to a curl download through the tun to the foreign's file server
         [[ -z "$dl" && "${loss:-100}" != 100 ]] && dl=$(bench_curl_mbps "http://$pa:5598/omnibench.bin")
@@ -1032,7 +1032,7 @@ cmd_bench_manual() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(timeout 20 iperf3 -c "$pa" -p 5599 -t 8 -O 3 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        dl=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
         rows+=("$t|${dl:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         i=$((i+1))
