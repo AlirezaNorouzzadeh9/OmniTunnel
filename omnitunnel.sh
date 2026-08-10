@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.5.2"
+VERSION="2.5.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -907,7 +907,7 @@ bench_run() {
     local raw_dl raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 5 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
+        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; fi
     printf "  download %s   rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
 
@@ -952,7 +952,7 @@ bench_run() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(timeout 20 iperf3 -c "$pa" -p 5599 -t 6 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        dl=$(timeout 20 iperf3 -c "$pa" -p 5599 -t 8 -O 3 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
         # if iperf couldn't measure but the tunnel is actually up (loss < 100),
         # fall back to a curl download through the tun to the foreign's file server
         [[ -z "$dl" && "${loss:-100}" != 100 ]] && dl=$(bench_curl_mbps "http://$pa:5598/omnibench.bin")
@@ -1016,7 +1016,7 @@ cmd_bench_manual() {
     local raw_dl raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 5 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
+        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; fi
     echo; printf "%b\n" "${C_BOLD}Measuring each tunnel...${C_RESET}"
     local rows=() i=0 t
@@ -1032,7 +1032,7 @@ cmd_bench_manual() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(timeout 20 iperf3 -c "$pa" -p 5599 -t 6 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        dl=$(timeout 20 iperf3 -c "$pa" -p 5599 -t 8 -O 3 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
         rows+=("$t|${dl:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         i=$((i+1))
@@ -1187,6 +1187,33 @@ pick_instance() {
     [[ -n "$PICK" ]] || { warn "no tunnel numbered $ch"; return 1; }
     return 0
 }
+# Choose the forward protocol by number. Sets PROTO to tcp / udp / both.
+pick_proto() {
+    PROTO=""
+    printf '  %bprotocol:%b\n' "$C_DIM" "$C_RESET"
+    printf '   %b1%b. tcp\n   %b2%b. udp\n   %b3%b. udp + tcp  (both)\n' \
+        "$C_BCYN$C_BOLD" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"
+    printf '  %b❯%b ' "$C_BCYN$C_BOLD" "$C_RESET"; local pn; read -r pn || true
+    case "$pn" in 1) PROTO=tcp;; 2) PROTO=udp;; 3) PROTO=both;; *) warn "pick 1, 2 or 3"; return 1;; esac
+    return 0
+}
+# List instance $1's forwarded ports by number; set PORT_PICK to the chosen one.
+pick_fwd_port() {
+    PORT_PICK=""; local pf p ports=() seen=" " i=1 x ch
+    pf="$(inst_pf "$1")"
+    if [[ -s "$pf" ]]; then
+        while IFS=: read -r _ p; do [[ -z "$p" || "$seen" == *" $p "* ]] && continue; seen+="$p "; ports+=("$p"); done < "$pf"
+    fi
+    [[ ${#ports[@]} -eq 0 ]] && { warn "this tunnel has no forwards"; return 1; }
+    printf '  %bwhich forward to remove:%b\n' "$C_DIM" "$C_RESET"
+    for x in "${ports[@]}"; do printf '   %b%d%b. port %s\n' "$C_BCYN$C_BOLD" "$i" "$C_RESET" "$x"; i=$((i+1)); done
+    printf '   %b0%b. cancel\n  %b❯%b ' "$C_DIM" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"; read -r ch || true
+    [[ "$ch" =~ ^[0-9]+$ ]] || { warn "enter a number"; return 1; }
+    [[ "$ch" == 0 ]] && return 1
+    PORT_PICK="${ports[$((ch-1))]:-}"
+    [[ -n "$PORT_PICK" ]] || { warn "no forward numbered $ch"; return 1; }
+    return 0
+}
 
 # The home screen: wordmark, build info, this box, then the menu. Sub-screens
 # get the compact one-line header instead (pass a crumb).
@@ -1335,15 +1362,19 @@ menu_pf() {
         done
         [[ "$any" == 0 ]] && printf '  %b(add a tunnel first)%b\n' "$C_DIM" "$C_RESET"
         echo
-        nitem 1 "Add a forward     (instance · tcp/udp/both · port)" "$C_BGRN$C_BOLD"
-        nitem 2 "Remove a forward  (instance · port)"                "$C_BRED$C_BOLD"
+        nitem 1 "Add a forward     (pick tunnel · protocol · port)" "$C_BGRN$C_BOLD"
+        nitem 2 "Remove a forward  (pick tunnel · port)"            "$C_BRED$C_BOLD"
         nitem 0 "Back"
         rule_green
         printf '  %bEnter your choice [0-2]:%b ' "$C_BGRN" "$C_RESET"
         read -r c
         case "$c" in
-            1) if pick_instance; then n="$PICK"; read -erp "  proto (tcp/udp/both): " p; read -erp "  port: " po; [[ -n "$p" && -n "$po" ]] && pf_add "$n" "$p" "$po"; fi; pause;;
-            2) if pick_instance; then n="$PICK"; read -erp "  port: " po; [[ -n "$po" ]] && pf_del "$n" "$po"; fi; pause;;
+            1) if pick_instance; then n="$PICK"
+                 if pick_proto; then read -erp "  port number: " po
+                     if [[ "$po" =~ ^[0-9]+$ ]]; then pf_add "$n" "$PROTO" "$po"; else warn "port must be a number"; fi
+                 fi
+               fi; pause;;
+            2) if pick_instance; then n="$PICK"; if pick_fwd_port "$n"; then pf_del "$n" "$PORT_PICK"; fi; fi; pause;;
             0) return;;
         esac
     done
