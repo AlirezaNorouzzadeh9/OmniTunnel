@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.5.1"
+VERSION="2.5.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -775,19 +775,19 @@ wizard_add() {
     echo; echo "${C_BOLD}Add a tunnel  (this box = near side / client; far = foreign / server)${C_RESET}"
     local ci=1 types=() t
     for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
-    read -rp "Tunnel type [1]: " ch; ch="${ch:-1}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
+    read -erp "Tunnel type [1]: " ch; ch="${ch:-1}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
     local mylip; mylip="$(default_local_ip)"
-    read -rp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
-    read -rp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
-    read -rp "Far SSH user [root]: " fu; fu="${fu:-root}"
+    read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
+    read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
+    read -erp "Far SSH user [root]: " fu; fu="${fu:-root}"
     read -rsp "Far SSH password (blank = ssh key): " fp; echo; [[ -n "$fp" ]] && save_peer "$fhost" "$fu" "$fp"
-    read -rp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
+    read -erp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
     local nc=16 shape=none
     if [[ "$t" == mux ]]; then
-        read -rp "Parallel links N [16]: " nc; nc="${nc:-16}"
-        read -rp "Download shaper rate to stabilise (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
+        read -erp "Parallel links N [16]: " nc; nc="${nc:-16}"
+        read -erp "Download shaper rate to stabilise (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
     elif [[ "$t" == hysteria ]]; then
-        read -rp "Brutal-CC target bandwidth in mbps (higher pushes harder through loss) [200]: " shape; shape="${shape:-200}"
+        read -erp "Brutal-CC target bandwidth in mbps (higher pushes harder through loss) [200]: " shape; shape="${shape:-200}"
     fi
     # collision-safe allocation vs whatever the foreign already runs (see cmd_add_auto)
     local fsub fport fnames
@@ -809,15 +809,15 @@ wizard_add_manual() {
     echo; echo "${C_BOLD}Add a tunnel - MANUAL${C_RESET} ${C_DIM}(no SSH to the foreign; nothing touches port 22)${C_RESET}"
     local ci=1 types=() t
     for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
-    read -rp "Tunnel type [2]: " ch; ch="${ch:-2}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
+    read -erp "Tunnel type [2]: " ch; ch="${ch:-2}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
     local mylip; mylip="$(default_local_ip)"
-    read -rp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
-    read -rp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
-    read -rp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
+    read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
+    read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
+    read -erp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
     local nc=16 shape=none
     if [[ "$t" == mux ]]; then
-        read -rp "Parallel links N [16]: " nc; nc="${nc:-16}"
-        read -rp "Download shaper rate (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
+        read -erp "Parallel links N [16]: " nc; nc="${nc:-16}"
+        read -erp "Download shaper rate (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
     fi
     cmd_add_manual "$t" "$kn" "$fhost" "$nc" "$shape" "$mylip"
 }
@@ -871,10 +871,10 @@ bench_curl_mbps() {
 bench_run() {
     need_root; ensure_binary
     local fhost fu fp mylip x
-    read -rp "Foreign server IP to benchmark against: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
-    read -rp "Foreign SSH user [root]: " fu; fu="${fu:-root}"
+    read -erp "Foreign server IP to benchmark against: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
+    read -erp "Foreign SSH user [root]: " fu; fu="${fu:-root}"
     read -rsp "Foreign SSH password (blank = ssh key): " fp; echo; [[ -n "$fp" ]] && save_peer "$fhost" "$fu" "$fp"
-    mylip="$(default_local_ip)"; read -rp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
+    mylip="$(default_local_ip)"; read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
 
     # deploy core + iperf3 server on the far side
@@ -976,12 +976,12 @@ bench_run() {
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
     local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
-    read -rp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
+    read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
-    read -rp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
+    read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
     local nc=16 shape=none
-    [[ "$keep" == mux ]] && { read -rp "mux links N [16]: " nc; nc="${nc:-16}"; read -rp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
-    [[ "$keep" == hysteria ]] && { read -rp "Brutal-CC target bandwidth mbps [200]: " shape; shape="${shape:-200}"; }
+    [[ "$keep" == mux ]] && { read -erp "mux links N [16]: " nc; nc="${nc:-16}"; read -erp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
+    [[ "$keep" == hysteria ]] && { read -erp "Brutal-CC target bandwidth mbps [200]: " shape; shape="${shape:-200}"; }
     local fsub fport fnames
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
     fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
@@ -1012,7 +1012,7 @@ cmd_bench_manual() {
     echo "1) On the FOREIGN server ($fhost) run these two lines:"
     echo "   ${C_CYAN}bash <(curl -fsSL $RAW_BASE/install.sh)${C_RESET}"
     echo "   ${C_CYAN}omnitunnel bench-server $token${C_RESET}"
-    read -rp "2) Press Enter here once it prints 'benchmark server ready'... " _
+    read -erp "2) Press Enter here once it prints 'benchmark server ready'... " _
     local raw_dl raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
@@ -1045,11 +1045,11 @@ cmd_bench_manual() {
     printf '  %bKeep one as a permanent instance?%b %b(sets up its own fresh token)%b ' "$C_BGRN" "$C_RESET" "$C_GREY" "$C_RESET"
     local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
-    read -rp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
+    read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
-    read -rp "Name for the kept instance [main]: " kn; kn="${kn:-main}"
+    read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"
     local nc=16 shape=none
-    [[ "$keep" == mux ]] && { read -rp "mux links N [16]: " nc; nc="${nc:-16}"; read -rp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
+    [[ "$keep" == mux ]] && { read -erp "mux links N [16]: " nc; nc="${nc:-16}"; read -erp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
     cmd_add_manual "$keep" "$kn" "$fhost" "$nc" "$shape" "$mylip"
 }
 # Foreign side: bring up all four server tunnels + an iperf3 server, from a token.
@@ -1122,7 +1122,7 @@ cmd_uninstall() {
     echo "  - the 'omnitunnel' command itself"
     echo "  ${C_DIM}(it does not touch anything OmniTunnel didn't create)${C_RESET}"
     echo
-    local a; read -rp "Type 'DELETE' to remove everything: " a || true
+    local a; read -erp "Type 'DELETE' to remove everything: " a || true
     [[ "$a" == "DELETE" ]] || { info "aborted - nothing removed."; return 0; }
     echo
     # 1) clean removal of each instance the tool knows about
@@ -1169,6 +1169,24 @@ rule_green() { printf '  %b%s%b\n' "$C_BGRN" "$(_drule)" "$C_RESET"; }
 kv() { printf '  %b%-16s%b %b%s%b\n' "$C_BCYN" "$1" "$C_RESET" "${3:-$C_WHITE}" "$2" "$C_RESET"; }
 # home-screen menu entry:  1. Label
 nitem() { printf '   %b%s. %s%b\n' "${3:-$C_WHITE}" "$1" "$2" "$C_RESET"; }
+# Choose an existing tunnel by NUMBER (never by typing its name - that is
+# error-prone and impossible for a non-ASCII / Persian name, and the terminal's
+# backspace can eat into the prompt when editing multibyte input). Sets PICK to
+# the chosen instance name; returns non-zero if there are none or the user cancels.
+pick_instance() {
+    PICK=""; local names=() n i=1
+    for n in $(list_instances); do names+=("$n"); done
+    if [[ ${#names[@]} -eq 0 ]]; then warn "no tunnels yet"; return 1; fi
+    printf '  %bpick a tunnel:%b\n' "$C_DIM" "$C_RESET"
+    for n in "${names[@]}"; do printf '   %b%d%b. %s\n' "$C_BCYN$C_BOLD" "$i" "$C_RESET" "$n"; i=$((i+1)); done
+    printf '   %b0%b. cancel\n  %b❯%b ' "$C_DIM" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"
+    local ch; read -r ch || true
+    [[ "$ch" =~ ^[0-9]+$ ]] || { warn "please enter a number"; return 1; }
+    [[ "$ch" == 0 ]] && return 1
+    PICK="${names[$((ch-1))]:-}"
+    [[ -n "$PICK" ]] || { warn "no tunnel numbered $ch"; return 1; }
+    return 0
+}
 
 # The home screen: wordmark, build info, this box, then the menu. Sub-screens
 # get the compact one-line header instead (pass a crumb).
@@ -1291,11 +1309,12 @@ menu_instances() {
         case "$c" in
             1) wizard_add; pause;;
             2) wizard_add_manual; pause;;
-            3) read -rp "  instance to remove: " n; [[ -z "$n" ]] && continue; inst_remove "$n"
-               read -rp "  also remove the far (foreign) side? [y/N]: " yn
-               if [[ "$yn" =~ ^[Yy] ]]; then read -rp "  foreign IP: " fh; peer_ssh "$fh" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" 2>/dev/null || true; fi; pause;;
-            4) read -rp "  instance to restart: " n; [[ -n "$n" ]] && inst_enable "$n"; pause;;
-            5) read -rp "  instance: " n; [[ -n "$n" ]] && journalctl -u "$(svc_name "$n")" -n 40 --no-pager 2>/dev/null || true; pause;;
+            3) if pick_instance; then n="$PICK"; inst_remove "$n"
+                 read -erp "  also remove the far (foreign) side? [y/N]: " yn
+                 if [[ "$yn" =~ ^[Yy] ]]; then read -erp "  foreign IP: " fh; [[ -n "$fh" ]] && peer_ssh "$fh" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" 2>/dev/null || true; fi
+               fi; pause;;
+            4) if pick_instance; then inst_enable "$PICK"; fi; pause;;
+            5) if pick_instance; then journalctl -u "$(svc_name "$PICK")" -n 40 --no-pager 2>/dev/null || true; fi; pause;;
             0) return;;
         esac
     done
@@ -1323,8 +1342,8 @@ menu_pf() {
         printf '  %bEnter your choice [0-2]:%b ' "$C_BGRN" "$C_RESET"
         read -r c
         case "$c" in
-            1) read -rp "  instance: " n; read -rp "  proto (tcp/udp/both): " p; read -rp "  port: " po; [[ -n "$n" && -n "$p" && -n "$po" ]] && pf_add "$n" "$p" "$po"; pause;;
-            2) read -rp "  instance: " n; read -rp "  port: " po; [[ -n "$n" && -n "$po" ]] && pf_del "$n" "$po"; pause;;
+            1) if pick_instance; then n="$PICK"; read -erp "  proto (tcp/udp/both): " p; read -erp "  port: " po; [[ -n "$p" && -n "$po" ]] && pf_add "$n" "$p" "$po"; fi; pause;;
+            2) if pick_instance; then n="$PICK"; read -erp "  port: " po; [[ -n "$po" ]] && pf_del "$n" "$po"; fi; pause;;
             0) return;;
         esac
     done
@@ -1347,7 +1366,7 @@ menu_main() {
         read -r c
         case "$c" in
             1) bench_run; pause;;
-            2) local fh mip; read -rp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -rp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
+            2) local fh mip; read -erp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -erp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
             3) menu_instances;;
             4) menu_pf;;
             5) banner "Status of everything"; echo; inst_header; rule; local a5=0
