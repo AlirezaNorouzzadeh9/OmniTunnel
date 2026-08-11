@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.5.4"
+VERSION="2.5.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -588,6 +588,55 @@ inst_remove() {
     systemctl daemon-reload 2>/dev/null || true
     pf_flush_chain "$1"; ip link del "$DEV" 2>/dev/null || true
     rm -rf "$(inst_path "$1")"; ok "removed instance '$1'"
+}
+
+# User-facing removal. For a CLIENT tunnel it removes the FAR (foreign) side FIRST
+# - actively verifying the foreign no longer has the instance, retrying until it
+# does - and only then removes the local side. If the foreign can't be confirmed
+# gone, the LOCAL side is kept (so nothing/no info is lost) and it stops with a
+# clear message, so a tunnel is never half-deleted with an orphan left abroad.
+# 'inst_remove' stays local-only (it is exactly what the foreign runs via _remove).
+remove_instance_fully() {
+    need_root; local n="$1"
+    inst_exists "$n" || { warn "no such instance: $n"; return 0; }
+    load_inst "$n"
+    # A server-side instance IS the foreign end; just remove it here.
+    [[ "$ROLE" == server ]] && { inst_remove "$n"; return 0; }
+    local fhost="$PEER_IP"
+    [[ -z "$fhost" ]] && { inst_remove "$n"; return 0; }
+    # Do we have a way to reach the foreign to delete its side?
+    _peer_creds "$fhost"
+    local have_login=0
+    [[ -n "$PEER_PASS" ]] && have_login=1
+    [[ "$have_login" == 0 ]] && ls "$HOME"/.ssh/id_* >/dev/null 2>&1 && have_login=1 || true
+    if [[ "$have_login" == 0 ]]; then
+        warn "No SSH login saved for the foreign $fhost (this tunnel was set up in MANUAL mode)."
+        warn "Remove its side on the foreign yourself:  ${C_CYAN}omnitunnel remove${C_RESET}  (numbered menu item there)."
+        local yn; read -rp "  Remove ONLY the local side now, leaving the foreign as-is? [y/N]: " yn || true
+        [[ "$yn" =~ ^[Yy] ]] && inst_remove "$n" || info "nothing removed."
+        return 0
+    fi
+    info "Removing the far side on $fhost and verifying it is gone..."
+    local i vr gone=0
+    for i in 1 2 3 4 5 6; do
+        peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" >/dev/null 2>&1
+        vr=$(peer_ssh "$fhost" "test -e /etc/omnitunnel/inst/'$n'/instance.conf && echo OMNIV_EXISTS || echo OMNIV_GONE" 2>/dev/null)
+        case "$vr" in
+            *OMNIV_GONE*)   gone=1; break;;
+            *OMNIV_EXISTS*) warn "  far side still present (attempt $i/6) - retrying...";;
+            *)              warn "  could not reach $fhost to verify (attempt $i/6) - retrying...";;
+        esac
+        sleep 4
+    done
+    if [[ "$gone" != 1 ]]; then
+        warn "Could NOT confirm the far side on $fhost was removed after 6 attempts."
+        warn "Keeping the LOCAL tunnel so nothing is lost. Fix the foreign's reachability (SSH / port 22)"
+        warn "and run remove again, or delete it on the foreign by hand:  ${C_CYAN}omnitunnel remove${C_RESET}"
+        return 1
+    fi
+    ok "far side on $fhost confirmed removed."
+    inst_remove "$n"
+    return 0
 }
 
 # allocation helpers (non-overlapping subnet + free udp/tcp port per box)
@@ -1336,10 +1385,7 @@ menu_instances() {
         case "$c" in
             1) wizard_add; pause;;
             2) wizard_add_manual; pause;;
-            3) if pick_instance; then n="$PICK"; inst_remove "$n"
-                 read -erp "  also remove the far (foreign) side? [y/N]: " yn
-                 if [[ "$yn" =~ ^[Yy] ]]; then read -erp "  foreign IP: " fh; [[ -n "$fh" ]] && peer_ssh "$fh" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" 2>/dev/null || true; fi
-               fi; pause;;
+            3) if pick_instance; then remove_instance_fully "$PICK"; fi; pause;;
             4) if pick_instance; then inst_enable "$PICK"; fi; pause;;
             5) if pick_instance; then journalctl -u "$(svc_name "$PICK")" -n 40 --no-pager 2>/dev/null || true; fi; pause;;
             0) return;;
@@ -1425,7 +1471,8 @@ case "${1:-menu}" in
     list)             for n in $(list_instances); do inst_status "$n"; done;;
     status)           inst_status "${2:?instance}";;
     enable)           inst_enable "${2:?instance}";;
-    remove|_remove)   inst_remove "${2:?instance}";;
+    remove)           need_root; remove_instance_fully "${2:?instance}";;
+    _remove)          need_root; inst_remove "${2:?instance}";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           pf_del "${2:?}" "${3:?}";;
     _postup)          cmd_postup "${2:?}";;
