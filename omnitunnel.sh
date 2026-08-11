@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.5.5"
+VERSION="2.5.6"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -618,6 +618,9 @@ remove_instance_fully() {
     fi
     info "Removing the far side on $fhost and verifying it is gone..."
     local i vr gone=0
+    # A failing SSH (unreachable / wrong creds) returns non-zero; relax 'set -e'
+    # so the loop actually RETRIES instead of aborting on the first failure.
+    set +e
     for i in 1 2 3 4 5 6; do
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$n'" >/dev/null 2>&1
         vr=$(peer_ssh "$fhost" "test -e /etc/omnitunnel/inst/'$n'/instance.conf && echo OMNIV_EXISTS || echo OMNIV_GONE" 2>/dev/null)
@@ -628,6 +631,7 @@ remove_instance_fully() {
         esac
         sleep 4
     done
+    set -e
     if [[ "$gone" != 1 ]]; then
         warn "Could NOT confirm the far side on $fhost was removed after 6 attempts."
         warn "Keeping the LOCAL tunnel so nothing is lost. Fix the foreign's reachability (SSH / port 22)"
