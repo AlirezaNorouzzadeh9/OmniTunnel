@@ -97,50 +97,56 @@ at a foreign server (IP + SSH login) and it will:
 4. **remove every test tunnel from both sides**, then let you keep exactly one
    as a permanent instance.
 
-Real numbers from a heavily-filtered Iran ISP (to one foreign box):
+Real numbers, measured end-to-end through the manager on a fast Iran→foreign
+route — Iran server **"88"** to a foreign box:
 
 ```
 ──────────────────────────  Benchmark results  ──────────────────────────
 
-  raw path (plain TCP, policed)   180 Mbits/sec   rtt 40 ms
+  raw path (plain TCP)   2.51 Gbits/sec   rtt 45 ms
 
     TYPE      DOWNLOAD              LOSS   PING
-  → gre       ██████████████ 652M    0%     40    fastest
-    icmp      ████████       350M    0%     40
-    hysteria  ██             100M    0%     40    stealth pick
-    mux       ██             87M     0%     40
-    ws        ██             82M     0%     41
-    fou       █              4.1M    22%    41
-    udp       █              3.8M    23%    41
-    vxlan     █              3.5M    24%    41
-    tcp       █              1.2M    0%     86
+  → fou       ██████████████ 784M    0%     44    fastest · stealth pick
+    gre       █████████████  700M    0%     45
+    vxlan     █████████      503M    0%     39
+    udp       ███████        408M    0%     41
+    icmp      ██████         324M    0%     40
+    hysteria  ███            194M    0%     44
+    ws        █              74M     0%     108
+    mux       █              63M     0%     95
+    tcp       █              19M     0%     77
 ```
 
 The bar is scaled to the fastest tunnel; **→** marks the outright winner and
-**stealth pick** marks the fastest *fully obfuscated* transport (the two answers
-the run exists to give). This particular ISP rate-crushes all UDP, so `udp` and
-the two UDP-carried newcomers `fou`/`vxlan` collapse with it — see below for the
-ISP where they do the opposite.
+**stealth pick** marks the fastest *fully obfuscated* transport. Here the new
+`fou` (GRE-in-UDP) tops the table at **784 Mbit — past raw GRE's 700** while
+looking like ordinary UDP on the wire: this ISP polices neither plain TCP nor
+arbitrary UDP, it only blocks the narrow WireGuard port range, which
+`fou`/`vxlan`/`udp` simply sidestep.
 
-Here `gre` and `icmp` beat the "raw path" figure because that raw number is a
-plain-TCP download, which this ISP **polices** — GRE and ICMP aren't policed, so
-they expose the link's real line rate. TCP is 5-tuple-poisoned and plain UDP is
-rate-crushed, so a single `tcp` or `udp` tunnel is nearly useless here. The
-interesting result is `hysteria`: the same policed UDP path that limits the
-plaintext `udp` tunnel to **3.8 Mbit** carries **~100 Mbit** under Hysteria's
-Brutal congestion control — the fastest of the *fully obfuscated* transports on
-this ISP, and indistinguishable from HTTP/3. `gre`/`icmp` are faster still but
-are recognisable protocols; when stealth matters, `hysteria` is the sweet spot.
+That result is **route-specific** — the same nine transports reorder completely
+on other ISPs. Measured across three routes (download through the tunnel, Mbit/s):
 
-And on a **different** Iran ISP the table flips completely. On one that leaves
-arbitrary UDP alone and instead fingerprints GRE, the same `fou` tunnel (GRE
-hidden inside UDP) measured **784 Mbit — beating raw GRE's 700** on that box —
-while looking like ordinary UDP on the wire; `vxlan` ran 503 and plain `udp` 408,
-all where this first ISP crushes them to single digits. Yet a *third* ISP
-throttles every UDP port except 443, and there only `hysteria` (QUIC on 443)
-survives among the UDP carriers while `gre`/`icmp` carry the day. Nothing wins
-everywhere — which is the whole point of benchmarking. Re-run it from the menu
-any time conditions change.
+| Transport | 88→143 | 37→143 | 88→45 |
+|-----------|-------:|-------:|------:|
+| raw (no tunnel) | 2510 | 125 | ~21 |
+| **fou** 🆕 | **784** 🏆 | 1.2 | 33.9 |
+| gre | 700 | 123 | 43.8 |
+| **vxlan** 🆕 | 503 | 3.5 | 22.2 |
+| udp | 408 | fail | 33.7 |
+| icmp | 324 | **151** 🏆 | 16.1 |
+| hysteria | 194 | 103 | **44.6** 🏆 |
+| ws | 74 | 3.1 | 13.7 |
+| mux | 63 | 31.7 | 6.9 |
+| tcp | 19 | 43 | 3.7 |
+
+`37→143` is a heavily-policed Iran ISP: plain TCP is throttled (raw 125), so
+`icmp` (151) and `gre` (123) *beat* the raw path — and, crucially, that ISP
+rate-crushes every non-443 UDP port, so `udp`/`fou`/`vxlan` collapse to almost
+nothing while `hysteria` (QUIC on 443) still carries 103. `88→45` is a weak,
+lossy path to a second foreign box where hysteria's loss-agnostic Brutal
+congestion control wins outright. Nothing wins everywhere — which is the whole
+point of benchmarking. Re-run it from the menu any time conditions change.
 
 > These are real measurements taken end-to-end through the manager across
 > several Iran servers and two foreign boxes — the numbers above are one
