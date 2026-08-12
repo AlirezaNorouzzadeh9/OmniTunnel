@@ -6,13 +6,13 @@
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
 traffic policing and DPI.** Prebuilt static binaries, one English
-menu-driven manager, seven interchangeable tunnel transports, and any
+menu-driven manager, nine interchangeable tunnel transports, and any
 many-to-many topology you need.
 
 Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
 police, throttle, or block traffic very differently depending on the transport
 and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
-ICMP is now just one of the seven transports.)
+ICMP is now just one of the nine transports.)
 
 ---
 
@@ -91,7 +91,7 @@ From the main menu choose **“Benchmark all tunnels & pick the best.”** Point
 at a foreign server (IP + SSH login) and it will:
 
 1. measure the **raw** path (download + rtt),
-2. bring up each of the seven tunnels in turn and measure **download, packet
+2. bring up each of the nine tunnels in turn and measure **download, packet
    loss and ping** through it,
 3. print a comparison table,
 4. **remove every test tunnel from both sides**, then let you keep exactly one
@@ -100,17 +100,27 @@ at a foreign server (IP + SSH login) and it will:
 Real numbers from a heavily-filtered Iran ISP (to one foreign box):
 
 ```
-==================== BENCHMARK RESULTS ====================
-  raw path : download 180 Mbits/sec (plain TCP - policed) , rtt 40 ms
-  TYPE      DOWNLOAD(tunnel)   LOSS    PING(ms)
-  gre       652 Mbits/sec      0%      40
-  icmp      350 Mbits/sec      0%      40
-  hysteria  100 Mbits/sec      0%      40
-  mux       87  Mbits/sec      0%      40
-  udp       3.8 Mbits/sec      23%     41
-  tcp       1.2 Mbits/sec      0%      86
-===========================================================
+──────────────────────────  Benchmark results  ──────────────────────────
+
+  raw path (plain TCP, policed)   180 Mbits/sec   rtt 40 ms
+
+    TYPE      DOWNLOAD              LOSS   PING
+  → gre       ██████████████ 652M    0%     40    fastest
+    icmp      ████████       350M    0%     40
+    hysteria  ██             100M    0%     40    stealth pick
+    mux       ██             87M     0%     40
+    ws        ██             82M     0%     41
+    fou       █              4.1M    22%    41
+    udp       █              3.8M    23%    41
+    vxlan     █              3.5M    24%    41
+    tcp       █              1.2M    0%     86
 ```
+
+The bar is scaled to the fastest tunnel; **→** marks the outright winner and
+**stealth pick** marks the fastest *fully obfuscated* transport (the two answers
+the run exists to give). This particular ISP rate-crushes all UDP, so `udp` and
+the two UDP-carried newcomers `fou`/`vxlan` collapse with it — see below for the
+ISP where they do the opposite.
 
 Here `gre` and `icmp` beat the "raw path" figure because that raw number is a
 plain-TCP download, which this ISP **polices** — GRE and ICMP aren't policed, so
@@ -121,12 +131,21 @@ plaintext `udp` tunnel to **3.8 Mbit** carries **~100 Mbit** under Hysteria's
 Brutal congestion control — the fastest of the *fully obfuscated* transports on
 this ISP, and indistinguishable from HTTP/3. `gre`/`icmp` are faster still but
 are recognisable protocols; when stealth matters, `hysteria` is the sweet spot.
-On a *different* ISP the winner might be `udp` or `mux` — which is the whole
-point of benchmarking. Re-run it from the menu any time conditions change.
 
-> These are real measurements taken end-to-end through the manager on two
-> different Iran servers (one auto-provisioned over SSH, one set up with the
-> no-SSH paste token) to the same foreign box.
+And on a **different** Iran ISP the table flips completely. On one that leaves
+arbitrary UDP alone and instead fingerprints GRE, the same `fou` tunnel (GRE
+hidden inside UDP) measured **784 Mbit — beating raw GRE's 700** on that box —
+while looking like ordinary UDP on the wire; `vxlan` ran 503 and plain `udp` 408,
+all where this first ISP crushes them to single digits. Yet a *third* ISP
+throttles every UDP port except 443, and there only `hysteria` (QUIC on 443)
+survives among the UDP carriers while `gre`/`icmp` carry the day. Nothing wins
+everywhere — which is the whole point of benchmarking. Re-run it from the menu
+any time conditions change.
+
+> These are real measurements taken end-to-end through the manager across
+> several Iran servers and two foreign boxes — the numbers above are one
+> representative policed ISP; the `fou`/`vxlan`/`hysteria` figures in the
+> paragraph are from the other measured routes.
 
 ---
 
