@@ -108,11 +108,13 @@ type_desc() {
 type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan ]]; }
 # native kernel tunnels - no compiled core binary involved
 type_is_kernel() { [[ "$1" == gre || "$1" == fou || "$1" == vxlan ]]; }
-# Starting port for auto-allocation. fou/vxlan carry REAL UDP, so keep them well
-# clear of the 51820-51899 WireGuard range that some ISPs (seen on IR mobile)
-# block wholesale - a fou/vxlan tunnel landing on 51821 there is silently dropped.
-# gre's "port" is only a GRE key (not a UDP port), so it can stay at 51820.
-port_base() { case "$1" in fou|vxlan) echo 28820;; *) echo 51820;; esac; }
+# Starting port for auto-allocation. udp/fou/vxlan carry REAL UDP, so keep them
+# well clear of the 51820-51899 WireGuard range that some ISPs (seen on IR mobile)
+# block wholesale - a UDP tunnel landing on 51821 there is silently dropped (this
+# bit the plain `udp` transport too). gre's "port" is only a GRE key, and
+# tcp/mux/ws are TCP, so those are unaffected and stay at 51820. hysteria runs its
+# own QUIC/443 masquerade and manages its own port.
+port_base() { case "$1" in udp|fou|vxlan) echo 28820;; *) echo 51820;; esac; }
 # hysteria is a separate engine: its own binary + YAML, no tun device, forwards
 # ports natively (no iptables DNAT). It gets special-cased throughout.
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
