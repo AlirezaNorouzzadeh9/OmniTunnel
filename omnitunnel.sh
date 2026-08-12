@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.5.6"
+VERSION="2.6.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -89,7 +89,7 @@ ensure_hysteria() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp"
+ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
@@ -99,13 +99,20 @@ type_desc() {
         ws)       echo "multi-connection WebSocket  (looks like HTTPS; stealthy)";;
         hysteria) echo "Hysteria2/QUIC  (loss-agnostic; beats UDP rate-policing; looks like HTTP/3)";;
         tcp)      echo "single TCP AEAD  (looks like one HTTPS connection)";;
+        fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
+        vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
         *) echo "";;
     esac
 }
-# gre and icmp are kernel/plaintext carriers - no PSK
-type_uses_key() { [[ "$1" != icmp && "$1" != gre ]]; }
-# gre is a native kernel tunnel - no compiled core binary involved
-type_is_kernel() { [[ "$1" == gre ]]; }
+# gre/icmp/fou/vxlan are kernel/plaintext carriers - no PSK
+type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan ]]; }
+# native kernel tunnels - no compiled core binary involved
+type_is_kernel() { [[ "$1" == gre || "$1" == fou || "$1" == vxlan ]]; }
+# Starting port for auto-allocation. fou/vxlan carry REAL UDP, so keep them well
+# clear of the 51820-51899 WireGuard range that some ISPs (seen on IR mobile)
+# block wholesale - a fou/vxlan tunnel landing on 51821 there is silently dropped.
+# gre's "port" is only a GRE key (not a UDP port), so it can stay at 51820.
+port_base() { case "$1" in fou|vxlan) echo 28820;; *) echo 51820;; esac; }
 # hysteria is a separate engine: its own binary + YAML, no tun device, forwards
 # ports natively (no iptables DNAT). It gets special-cased throughout.
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
@@ -148,6 +155,31 @@ NCONN=$nc
 SHAPE=$shape
 EOF
 }
+
+# ------------------------------------------------- kernel carrier commands ----
+# Native kernel tunnels (gre / fou / vxlan) are brought up with plain `ip`
+# commands - no core binary. PORT does double duty as the disambiguator so
+# several tunnels can share one endpoint pair without colliding:
+#   gre   -> GRE key
+#   fou   -> FOU UDP port AND the inner GRE key (GRE hidden inside UDP)
+#   vxlan -> VXLAN VNI AND UDP dstport
+# Called with an instance already loaded (DEV/LOCAL_IP/PEER_IP/... in scope).
+kernel_up_cmd() {
+    case "$TYPE" in
+        gre)
+            echo "modprobe ip_gre 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type gre local $LOCAL_IP remote $PEER_IP ttl 255 key $PORT; ip addr add $TUN_ADDR peer $PEER_ADDR dev $DEV; ip link set $DEV up mtu $MTU";;
+        fou)
+            # The FOU receive binding (ip fou add) is a global UDP:PORT -> GRE
+            # decap rule. On this kernel 'ip fou del' is unreliable ("Invalid
+            # argument"), so we never delete it: 'ip fou add' is idempotent
+            # ("in use" is harmless), the binding survives restarts, and a reused
+            # port simply reuses the existing rule. Teardown only drops the device.
+            echo "modprobe fou 2>/dev/null; modprobe ip_gre 2>/dev/null; ip link del $DEV 2>/dev/null; ip fou add port $PORT ipproto 47 2>/dev/null; ip link add $DEV type gre local $LOCAL_IP remote $PEER_IP ttl 255 key $PORT encap fou encap-sport $PORT encap-dport $PORT; ip addr add $TUN_ADDR peer $PEER_ADDR dev $DEV; ip link set $DEV up mtu $MTU";;
+        vxlan)
+            echo "modprobe vxlan 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type vxlan id $PORT local $LOCAL_IP remote $PEER_IP dstport $PORT ttl 255; ip addr add $TUN_ADDR/24 dev $DEV; ip link set $DEV up mtu $MTU";;
+    esac
+}
+kernel_down_cmd() { echo "ip link del $DEV 2>/dev/null"; }
 
 # ------------------------------------------------------- execstart builder ----
 build_execstart() {
@@ -414,9 +446,9 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     elif type_is_kernel "$TYPE"; then
-        # GRE (or other native kernel carrier): configured on start, removed on
-        # stop. PORT doubles as the GRE key so several GRE tunnels can share an
-        # endpoint pair without colliding. No compiled core binary involved.
+        # native kernel carrier (gre / fou / vxlan): configured on start, removed
+        # on stop. No compiled core binary involved. See kernel_up_cmd for how
+        # PORT disambiguates several tunnels sharing one endpoint pair.
         cat > "$unit" <<EOF
 [Unit]
 Description=OmniTunnel $TYPE instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
@@ -426,9 +458,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'modprobe ip_gre 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type gre local $LOCAL_IP remote $PEER_IP ttl 255 key $PORT; ip addr add $TUN_ADDR peer $PEER_ADDR dev $DEV; ip link set $DEV up mtu $MTU'
+ExecStart=/bin/sh -c '$(kernel_up_cmd)'
 ExecStartPost=$SCRIPT_PATH _postup $1
-ExecStop=-/sbin/ip link del $DEV
+ExecStop=-/bin/sh -c '$(kernel_down_cmd)'
 Restart=no
 
 [Install]
@@ -772,7 +804,7 @@ cmd_add_auto() {
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(alloc_port "$((51820+sub))" "$fport"); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
+    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$t" || key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost  (subnet 10.201.$sub.0/24, port/key $port)"
@@ -792,7 +824,7 @@ cmd_add_manual() {
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
     inst_exists "$kn" && die "instance $kn exists"
     local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(next_port "${want_port:-$((51820+sub))}"); key=$(gen_key); [[ "$t" == icmp || "$t" == gre ]] && key=""
+    port=$(next_port "${want_port:-$(( $(port_base "$t") + sub ))}"); key=$(gen_key); type_uses_key "$t" || key=""
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
@@ -849,7 +881,7 @@ wizard_add() {
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - pick a different name"; return;; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(alloc_port "$((51820+sub))" "$fport"); key=$(gen_key)
+    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key)
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
@@ -973,8 +1005,8 @@ bench_run() {
     for t in $ALL_TYPES; do
         local name="bench-$t" sub=$((base+i)); i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
-        port=$(next_port $((51840+sub))); key=$(gen_key)
-        [[ "$t" == icmp ]] && { key=""; }
+        port=$(next_port $(( $(port_base "$t") + sub ))); key=$(gen_key)
+        type_uses_key "$t" || key=""
         echo -n "  $t ... "
         # hysteria has no tun/ping: forward the iperf port through it and measure
         if type_is_hysteria "$t"; then
@@ -1040,7 +1072,7 @@ bench_run() {
     fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) die "the foreign already has an instance named '$kn' - choose a different name";; esac
-    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(alloc_port "$((51820+sub))" "$fport"); key=$(gen_key); [[ "$keep" == icmp || "$keep" == gre ]] && key=""
+    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(alloc_port "$(( $(port_base "$keep") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$keep" || key=""
     provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "kept '$keep' as instance '$kn' on both sides."
@@ -1343,7 +1375,7 @@ bench_table() {
         IFS='|' read -r t dl ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
         if _gt "$v" "$max"; then max="$v"; fi
-        case "$t" in udp|tcp|mux|ws|hysteria) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
+        case "$t" in udp|tcp|mux|ws|hysteria|fou) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
     echo

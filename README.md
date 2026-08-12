@@ -16,10 +16,10 @@ ICMP is now just one of the seven transports.)
 
 ---
 
-## Why seven transports?
+## Why nine transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
-**per-route and per-transport**, and it changes. OmniTunnel ships all seven and
+**per-route and per-transport**, and it changes. OmniTunnel ships all nine and
 lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
@@ -31,6 +31,8 @@ lets you **benchmark them and keep the winner**:
 | `mux`  | **Multi-connection TCP** — N parallel links, each inner flow pinned to one link | Hostile DPI that blocks UDP *and* poisons long-lived TCP 5-tuples |
 | `ws`   | **Multi-connection WebSocket** — real HTTP `Upgrade` handshake, AEAD payload inside masked WS frames | You need `mux`'s throughput but the carrier must be **indistinguishable from a browser/CDN WebSocket** on 443/80 |
 | `hysteria` | **Hysteria2 / QUIC** — bundled engine with the loss-agnostic *Brutal* congestion control, salamander obfuscation and a real website masquerade | UDP passes but is **rate-policed or lossy**: Brutal ignores the induced loss and pushes at a fixed rate, so a policed UDP path that crawls at a few Mbit for `udp` runs an order of magnitude faster here — while looking exactly like HTTP/3 |
+| `fou`  | **GRE-in-UDP** (Foo-over-UDP), native kernel tunnel (no key) — a GRE tunnel wrapped inside an ordinary UDP packet on a port you choose | You want GRE's near-line-rate speed but the ISP blocks raw protocol-47, or the carrier must **look like plain UDP** instead of a GRE tunnel |
+| `vxlan` | **VXLAN**, native kernel tunnel (no key) — Ethernet-in-UDP, the standard datacenter overlay | A kernel UDP carrier that blends in as ordinary overlay traffic; useful where `fou`'s GRE-in-UDP is fingerprinted but VXLAN is not |
 
 Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
 protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
