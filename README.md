@@ -124,34 +124,14 @@ looking like ordinary UDP on the wire: this ISP polices neither plain TCP nor
 arbitrary UDP, it only blocks the narrow WireGuard port range, which
 `fou`/`vxlan`/`udp` simply sidestep.
 
-That result is **route-specific** — the same nine transports reorder completely
-on other ISPs. Measured across three routes (download through the tunnel, Mbit/s):
+The winner is **link-specific**: where the ISP fingerprints GRE the encrypted
+UDP carriers lead, where it rate-crushes UDP the plaintext `gre`/`icmp` do, and
+on a lossy path `hysteria` does. Nothing wins everywhere — which is the whole
+point of benchmarking: **run it on your own link and keep the winner.** Re-run it
+from the menu any time conditions change.
 
-| Transport | 88→143 | 37→143 | 88→45 |
-|-----------|-------:|-------:|------:|
-| raw (no tunnel) | 2510 | 125 | ~21 |
-| **fou** 🆕 | **784** 🏆 | 1.2 | 33.9 |
-| gre | 700 | 123 | 43.8 |
-| **vxlan** 🆕 | 503 | 3.5 | 22.2 |
-| udp | 408 | fail | 33.7 |
-| icmp | 324 | **151** 🏆 | 16.1 |
-| hysteria | 194 | 103 | **44.6** 🏆 |
-| ws | 74 | 3.1 | 13.7 |
-| mux | 63 | 31.7 | 6.9 |
-| tcp | 19 | 43 | 3.7 |
-
-`37→143` is a heavily-policed Iran ISP: plain TCP is throttled (raw 125), so
-`icmp` (151) and `gre` (123) *beat* the raw path — and, crucially, that ISP
-rate-crushes every non-443 UDP port, so `udp`/`fou`/`vxlan` collapse to almost
-nothing while `hysteria` (QUIC on 443) still carries 103. `88→45` is a weak,
-lossy path to a second foreign box where hysteria's loss-agnostic Brutal
-congestion control wins outright. Nothing wins everywhere — which is the whole
-point of benchmarking. Re-run it from the menu any time conditions change.
-
-> These are real measurements taken end-to-end through the manager across
-> several Iran servers and two foreign boxes — the numbers above are one
-> representative policed ISP; the `fou`/`vxlan`/`hysteria` figures in the
-> paragraph are from the other measured routes.
+> A real measurement taken end-to-end through the manager on one representative
+> route; your own link will land differently — benchmark it and keep the winner.
 
 ---
 
