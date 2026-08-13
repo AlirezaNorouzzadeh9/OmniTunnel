@@ -98,31 +98,31 @@ at a foreign server (IP + SSH login) and it will:
    as a permanent instance.
 
 Real numbers, measured end-to-end through the manager on a fast Iran→foreign
-route — Iran server **"88"** to a foreign box:
+route — an Iran server to a foreign box:
 
 ```
 ──────────────────────────  Benchmark results  ──────────────────────────
 
-  raw path (plain TCP)   2.51 Gbits/sec   rtt 45 ms
+  raw path (plain TCP)   1.91 Gbits/sec   rtt 39 ms
 
     TYPE      DOWNLOAD              LOSS   PING
-  → fou       ██████████████ 784M    0%     44    fastest · stealth pick
-    gre       █████████████  700M    0%     45
-    vxlan     █████████      503M    0%     39
-    udp       ███████        408M    0%     41
-    icmp      ██████         324M    0%     40
-    hysteria  ███            194M    0%     44
-    ws        █              74M     0%     108
-    mux       █              63M     0%     95
-    tcp       █              19M     0%     77
+  → gre       ██████████████ 925M    0%     39    fastest
+    fou       █████████████  885M    0%     39    stealth pick
+    tcp       ██████████     643M    0%     41
+    vxlan     ████████       561M    0%     39
+    ws        ████████       554M    0%     44
+    mux       ████████       508M    0%     43
+    udp       ███████        480M    0%     40
+    icmp      ███████        439M    0%     40
+    hysteria  ███            193M    0%     44
 ```
 
 The bar is scaled to the fastest tunnel; **→** marks the outright winner and
-**stealth pick** marks the fastest *fully obfuscated* transport. Here the new
-`fou` (GRE-in-UDP) tops the table at **784 Mbit — past raw GRE's 700** while
-looking like ordinary UDP on the wire: this ISP polices neither plain TCP nor
-arbitrary UDP, it only blocks the narrow WireGuard port range, which
-`fou`/`vxlan`/`udp` simply sidestep.
+**stealth pick** marks the fastest *fully obfuscated* transport. Here kernel `gre` leads at 925 Mbit and `fou` (GRE-in-UDP) sits right behind at
+885 while looking like ordinary UDP on the wire — and the encrypted `tcp`, `ws`
+and `mux` carriers all clear 500 Mbit on this path too. (This ISP polices neither
+plain TCP nor arbitrary UDP; it only blocks the narrow WireGuard port range,
+which `fou`/`vxlan`/`udp` sidestep.)
 
 The winner is **link-specific**: where the ISP fingerprints GRE the encrypted
 UDP carriers lead, where it rate-crushes UDP the plaintext `gre`/`icmp` do, and
