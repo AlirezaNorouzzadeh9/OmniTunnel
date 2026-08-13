@@ -64,9 +64,15 @@ if [[ -f "$(dirname "$0")/bin/omnitun-$ARCH" ]]; then
     [[ -f "$SRC/bin/hysteria-$ARCH" ]] && cp "$SRC/bin/hysteria-$ARCH" "$DEST/bin/hysteria-$ARCH"
 else
     echo "downloading core + manager ..."
-    curl -fsSL "$RAW/bin/omnitun-$ARCH" -o "$DEST/bin/omnitun-$ARCH"
-    curl -fsSL "$RAW/omnitunnel.sh"      -o "$DEST/omnitunnel.sh"
-    curl -fsSL "$RAW/bin/hysteria-$ARCH" -o "$DEST/bin/hysteria-$ARCH" || true
+    # Cache-bust the raw CDN. A stale Fastly edge can otherwise hand back the
+    # previous omnitunnel.sh for a few minutes after a release - the version
+    # check below then sees NEW_VER == OLD_VER and silently reports "already up
+    # to date", so `omnitunnel update` looks like it ran but changed nothing.
+    # A unique query key + no-cache headers force a fresh copy every run.
+    CB="?cb=$(date +%s)-${RANDOM}${RANDOM}"; NOCACHE=(-H 'Cache-Control: no-cache' -H 'Pragma: no-cache')
+    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/omnitun-$ARCH$CB" -o "$DEST/bin/omnitun-$ARCH"
+    curl -fsSL "${NOCACHE[@]}" "$RAW/omnitunnel.sh$CB"      -o "$DEST/omnitunnel.sh"
+    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/hysteria-$ARCH$CB" -o "$DEST/bin/hysteria-$ARCH" || true
 fi
 
 chmod +x "$DEST/bin/omnitun-$ARCH" "$DEST/omnitunnel.sh"

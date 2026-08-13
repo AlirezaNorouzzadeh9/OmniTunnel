@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.0"
+VERSION="2.7.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1181,7 +1181,10 @@ cmd_update() {
     command -v curl >/dev/null 2>&1 || { warn "curl is required to update"; return 1; }
     info "Checking GitHub for a newer OmniTunnel (current v$VERSION)..."
     local tmp; tmp="$(mktemp)"
-    if ! curl -fsSL "$RAW_BASE/install.sh" -o "$tmp" 2>/dev/null; then
+    # cache-bust the raw CDN so a stale edge can't hand back the old install.sh
+    # (which would then fetch an old manager and report "already up to date")
+    if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+              "$RAW_BASE/install.sh?cb=$(date +%s)-${RANDOM}${RANDOM}" -o "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         warn "Could not reach GitHub from this box."
         warn "If it has no direct internet egress, update it by re-pushing the files"
