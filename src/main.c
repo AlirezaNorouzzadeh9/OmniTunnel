@@ -9,7 +9,7 @@ int tun_main_mux(int, char **);
 int tun_main_icmp(int, char **);
 int tun_main_ws(int, char **);
 
-#define TSUITE_VERSION "2.1.0"
+#define TSUITE_VERSION "2.2.0"
 
 static void usage(const char *a) {
     fprintf(stderr,

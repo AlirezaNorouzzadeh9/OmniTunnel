@@ -165,10 +165,11 @@ static int writen(int fd, const unsigned char *buf, size_t n) {
 }
 
 static void set_sockopts(int fd) {
-    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    int buf = 8 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* No SO_SNDBUF/SO_RCVBUF: pinning either one disables Linux TCP autotuning,
+     * which then pins the receive window near its initial ~64 KiB and rwnd-limits
+     * each link to ~20 Mbit on a high-BDP path. Autotuning grows it to the BDP. */
 }
 
 /* append a framed packet to a link's queue; drop if full (inner TCP will

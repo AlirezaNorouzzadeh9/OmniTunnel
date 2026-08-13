@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <poll.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <stdint.h>
@@ -124,59 +125,87 @@ static int writen(int fd, const unsigned char *buf, size_t n) {
     return 0;
 }
 
-/* tun -> encrypt -> TCP framed */
+/* tun -> encrypt -> TCP framed. Coalesces a burst of tun packets into ONE
+ * socket write (framing is self-delimiting, so concatenation is transparent to
+ * the peer): far fewer write syscalls and smooth, large TCP sends instead of a
+ * tiny segment per packet. */
+#define UP_BATCH 64
 static void *uplink(void *arg) {
     (void)arg;
     unsigned char in[MAX_INNER];
-    unsigned char frame[2 + MAX_FRAME];
+    unsigned char sbuf[UP_BATCH * (2 + MAX_FRAME)];
     while (running) {
-        ssize_t n = read(tun_fd, in, sizeof(in));
-        if (n <= 0) { if (errno == EINTR) continue; usleep(1000); continue; }
+        size_t used = 0; int cnt = 0;
+        for (;;) {
+            ssize_t n = read(tun_fd, in, sizeof(in));
+            if (n <= 0) { if (errno == EINTR) continue; break; }
+            unsigned char *fr = sbuf + used;
+            unsigned char *nonce = fr + 2;
+            next_nonce(nonce);
+            unsigned long long clen = 0;
+            aead_enc(fr + 2 + NONCE_LEN, &clen, in, (unsigned long long)n,
+                     NULL, 0, NULL, nonce, key);
+            size_t L = NONCE_LEN + clen;
+            fr[0] = (unsigned char)(L >> 8);
+            fr[1] = (unsigned char)(L & 0xff);
+            used += 2 + L; cnt++;
+            if (cnt >= UP_BATCH || used + (2 + MAX_FRAME) > sizeof(sbuf)) break;
+            struct pollfd pfd = { .fd = tun_fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pfd, 1, 0) <= 0) break;     /* nothing more queued - flush */
+        }
+        if (used == 0) { usleep(500); continue; }
         int fd = conn_fd;
         if (fd < 0) continue;                     /* not connected yet - drop */
-        unsigned char *nonce = frame + 2;
-        next_nonce(nonce);
-        unsigned long long clen = 0;
-        aead_enc(
-            frame + 2 + NONCE_LEN, &clen, in, (unsigned long long)n,
-            NULL, 0, NULL, nonce, key);
-        size_t L = NONCE_LEN + clen;
-        frame[0] = (unsigned char)(L >> 8);
-        frame[1] = (unsigned char)(L & 0xff);
         pthread_mutex_lock(&wlock);
-        int ok = (writen(fd, frame, 2 + L) == 0);
+        int ok = (writen(fd, sbuf, used) == 0);
         pthread_mutex_unlock(&wlock);
         if (!ok) { if (conn_fd == fd) { shutdown(fd, SHUT_RDWR); } }
     }
     return NULL;
 }
 
-/* TCP framed -> decrypt -> tun. Returns when the connection breaks. */
+/* TCP framed -> decrypt -> tun. Drains the socket in large 256 KiB reads and
+ * decodes every complete frame in the buffer per read. The old code read 2
+ * bytes then L bytes per packet, so the app drained the socket one small packet
+ * at a time and the receive window kept collapsing (rwnd-limited the sender to a
+ * fraction of the link). Returns when the connection breaks. */
+#define DL_BUF (1 << 18)
 static void downlink_once(int fd) {
-    unsigned char hdr[2];
-    unsigned char cbuf[MAX_FRAME];
+    unsigned char *buf = malloc(DL_BUF);
     unsigned char out[MAX_INNER + TAG_LEN];
+    if (!buf) return;
+    size_t have = 0;
     while (running) {
-        if (readn(fd, hdr, 2) < 0) return;
-        size_t L = (hdr[0] << 8) | hdr[1];
-        if (L < NONCE_LEN + TAG_LEN || L > MAX_FRAME) return;   /* desync/garbage */
-        if (readn(fd, cbuf, L) < 0) return;
-        unsigned long long mlen = 0;
-        if (aead_dec(
-                out, &mlen, NULL, cbuf + NONCE_LEN, (unsigned long long)(L - NONCE_LEN),
-                NULL, 0, cbuf, key) != 0)
-            return;                                             /* bad auth - reconnect */
-        int ilen = inner_ip_len(out, mlen);
-        if (ilen < 0) continue;
-        if (write(tun_fd, out, ilen) < 0 && errno != EAGAIN) { /* drop */ }
+        size_t off = 0;
+        while (have - off >= 2) {
+            size_t L = (buf[off] << 8) | buf[off + 1];
+            if (L < NONCE_LEN + TAG_LEN || L > MAX_FRAME) { free(buf); return; } /* desync */
+            if (have - off < 2 + L) break;          /* frame not fully arrived yet */
+            unsigned long long mlen = 0;
+            if (aead_dec(out, &mlen, NULL, buf + off + 2 + NONCE_LEN,
+                         (unsigned long long)(L - NONCE_LEN),
+                         NULL, 0, buf + off + 2, key) != 0) { free(buf); return; }
+            int ilen = inner_ip_len(out, mlen);
+            if (ilen > 0) { if (write(tun_fd, out, ilen) < 0 && errno != EAGAIN) { /* drop */ } }
+            off += 2 + L;
+        }
+        if (off > 0) { if (have > off) memmove(buf, buf + off, have - off); have -= off; }
+        if (have == DL_BUF) { free(buf); return; }  /* single frame > buffer: impossible, bail */
+        ssize_t r = read(fd, buf + have, DL_BUF - have);
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; free(buf); return; }
+        have += (size_t)r;
     }
+    free(buf);
 }
 
 static void set_sockopts(int fd) {
-    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    int buf = 8 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Deliberately do NOT pin SO_SNDBUF/SO_RCVBUF. Setting either one disables
+     * Linux TCP buffer autotuning; the receive window then stays pinned near its
+     * initial ~64 KiB (rcv_ssthresh) and rwnd-limits the flow to ~20 Mbit on a
+     * 40 ms / high-BDP path (measured). Autotuning grows both to the BDP by
+     * itself and lets a single tunnel connection reach line rate. */
 }
 
 static void sigh(int s){ (void)s; running = 0; if (conn_fd >= 0) shutdown(conn_fd, SHUT_RDWR); }
