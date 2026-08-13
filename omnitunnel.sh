@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.1"
+VERSION="2.7.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -756,6 +756,30 @@ peer_scp() { local h="$1" s="$2" d="$3"; _peer_creds "$h"; _proxy_opts
     else scp "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"; fi
 }
 
+# dotted-version compare: succeeds (0) only if $1 is strictly newer than $2
+ver_gt() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
+
+# add/bench push THIS box's manager+binary onto the foreign, overwriting whatever
+# is there (no version check - keeps provisioning simple). The one hazard is
+# DOWNGRADING a foreign that happens to be newer than us. So before provisioning,
+# peek at the foreign's version: if it is newer, self-update this box first and
+# re-run, so both ends land on the latest build instead of the foreign being
+# knocked back to our older one. Runs once per invocation (OMNI_SELFUPDATED).
+guard_peer_downgrade() {
+    [[ -n "${OMNI_SELFUPDATED:-}" ]] && return 0
+    local h="$1" pver
+    pver=$(peer_ssh "$h" "grep -m1 -oE 'VERSION=\"[0-9.]+\"' /opt/omnitunnel/omnitunnel.sh 2>/dev/null | grep -oE '[0-9.]+'" 2>/dev/null | tr -d '\r\n ')
+    [[ -n "$pver" ]] || return 0                 # foreign has no OmniTunnel yet
+    ver_gt "$pver" "$VERSION" || return 0         # we are same-or-newer: safe to push
+    warn "The foreign $h runs v$pver but this box is older (v$VERSION)."
+    warn "Updating this box first so the tunnel/benchmark can't downgrade the foreign..."
+    if cmd_update; then
+        ok "Updated to the latest - re-running..."
+        OMNI_SELFUPDATED=1 exec "$SCRIPT_PATH" ${OMNI_ARGV[@]+"${OMNI_ARGV[@]}"}
+    fi
+    die "self-update failed - run 'omnitunnel update' on this box and retry, so the newer foreign ($h v$pver) isn't downgraded."
+}
+
 # push the manager + the peer's own-arch binary, then bring up the server side
 provision_peer() {
     local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}"
@@ -797,6 +821,7 @@ cmd_add_auto() {
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
     inst_exists "$kn" && die "instance $kn exists"
     [[ -n "${OMNITUN_PEER_PASS:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "$OMNITUN_PEER_PASS"
+    guard_peer_downgrade "$fhost"
     # Ask the foreign what it already runs, so a second Iran box to the SAME foreign
     # gets its own subnet/port/key (and doesn't reuse a name) instead of clobbering
     # the first box's tunnel.
@@ -868,6 +893,7 @@ wizard_add() {
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
     read -erp "Far SSH user [root]: " fu; fu="${fu:-root}"
     read -rsp "Far SSH password (blank = ssh key): " fp; echo; [[ -n "$fp" ]] && save_peer "$fhost" "$fu" "$fp"
+    guard_peer_downgrade "$fhost"
     read -erp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
     local nc=16 shape=none
     if [[ "$t" == mux ]]; then
@@ -962,6 +988,7 @@ bench_run() {
     read -erp "Foreign SSH user [root]: " fu; fu="${fu:-root}"
     read -rsp "Foreign SSH password (blank = ssh key): " fp; echo; [[ -n "$fp" ]] && save_peer "$fhost" "$fu" "$fp"
     mylip="$(default_local_ip)"; read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
+    guard_peer_downgrade "$fhost"
     command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
 
     # deploy core + iperf3 server on the far side
@@ -1499,6 +1526,9 @@ menu_main() {
 
 # ------------------------------------------------------------------- main -----
 mkdir -p "$INST_DIR" "$PEER_DIR" 2>/dev/null || true
+# remember how we were invoked so guard_peer_downgrade can re-exec after a
+# self-update (see that function).
+OMNI_ARGV=("$@")
 case "${1:-menu}" in
     menu|"")          need_root; ensure_binary; menu_main;;
     bench)            need_root; bench_run;;
