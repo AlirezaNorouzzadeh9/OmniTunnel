@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.2"
+VERSION="2.7.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -767,9 +767,13 @@ ver_gt() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n
 # knocked back to our older one. Runs once per invocation (OMNI_SELFUPDATED).
 guard_peer_downgrade() {
     [[ -n "${OMNI_SELFUPDATED:-}" ]] && return 0
-    local h="$1" pver
-    pver=$(peer_ssh "$h" "grep -m1 -oE 'VERSION=\"[0-9.]+\"' /opt/omnitunnel/omnitunnel.sh 2>/dev/null | grep -oE '[0-9.]+'" 2>/dev/null | tr -d '\r\n ')
-    [[ -n "$pver" ]] || return 0                 # foreign has no OmniTunnel yet
+    local h="$1" pver=""
+    # NB: the '|| true' is essential. Under 'set -euo pipefail', if the foreign
+    # has no manager yet (the normal first-time case) the remote grep exits
+    # non-zero, pipefail propagates it to the assignment, and set -e would abort
+    # the WHOLE add/bench silently right after the "This box public IP" prompt.
+    pver=$(peer_ssh "$h" "grep -m1 -oE 'VERSION=\"[0-9.]+\"' /opt/omnitunnel/omnitunnel.sh 2>/dev/null | grep -oE '[0-9.]+'" 2>/dev/null | tr -d '\r\n ') || true
+    [[ -n "$pver" ]] || return 0                 # foreign has no OmniTunnel yet - just provision it
     ver_gt "$pver" "$VERSION" || return 0         # we are same-or-newer: safe to push
     warn "The foreign $h runs v$pver but this box is older (v$VERSION)."
     warn "Updating this box first so the tunnel/benchmark can't downgrade the foreign..."
