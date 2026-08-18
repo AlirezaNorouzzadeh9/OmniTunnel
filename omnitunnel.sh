@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.3"
+VERSION="2.7.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -488,14 +488,19 @@ TimeoutStopSec=5
 WantedBy=multi-user.target
 EOF
     fi
-    systemctl daemon-reload
+    systemctl daemon-reload || true
 }
 cmd_postup() { load_inst "$1"; apply_tuning "$DEV" "$SHAPE"; pf_apply_all "$1" || true; }
 
 inst_enable() {
     need_root; load_inst "$1"; write_service "$1"
     systemctl enable "$(svc_name "$1")" >/dev/null 2>&1 || true
-    systemctl restart "$(svc_name "$1")"; sleep 2; inst_status "$1"
+    # A failed unit start must NOT silently abort the whole (set -euo pipefail)
+    # run - that reads as the tool "cancelling/disconnecting" with no message.
+    # Warn and carry on; callers that care check inst_running afterwards.
+    systemctl restart "$(svc_name "$1")" 2>/dev/null \
+        || warn "service $(svc_name "$1") did not start cleanly - see: journalctl -u $(svc_name "$1")"
+    sleep 2; inst_status "$1" || true
 }
 inst_running() { systemctl is-active "$(svc_name "$1")" >/dev/null 2>&1; }
 inst_header() {
@@ -560,7 +565,7 @@ inst_detail() {
         return 0
     fi
     if type_is_hysteria "$TYPE"; then
-        local nf; nf=$(grep -c . "$(inst_pf "$1")" 2>/dev/null || echo 0)
+        local nf; nf=$(grep -c . "$(inst_pf "$1")" 2>/dev/null) || nf=0
         printf '     %b└─ socks 127.0.0.1:%s · %s fwd · proxy mode (no L3 IP)%b\n' \
             "$C_GREY" "$PORT" "$nf" "$C_RESET"
     else
@@ -879,9 +884,18 @@ cmd_server_token() {
     [[ -n "$name" && -n "$t" ]] || die "invalid token"
     if type_is_hysteria "$t"; then ensure_hysteria
     elif ! type_is_kernel "$t"; then ensure_binary; fi
-    inst_exists "$name" && die "instance $name already exists"
+    # Re-running the SAME token must be idempotent. A first attempt that half-
+    # failed (or was Ctrl-C'd) leaves the instance dir behind and this used to
+    # die "already exists" on every retry - so the foreign could never be set up.
+    # Replace it, then verify the unit actually came up and roll back if it did
+    # not, so the token stays retryable.
+    inst_exists "$name" && { warn "instance '$name' already exists - replacing it"; inst_remove "$name" >/dev/null 2>&1 || true; }
     create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc"
     inst_enable "$name"
+    if ! inst_running "$name"; then
+        inst_remove "$name" >/dev/null 2>&1 || true
+        die "server side '$name' failed to start (cleaned up - fix the cause and re-run the token). check: journalctl -u $(svc_name "$name")"
+    fi
     ok "foreign (server) side '$name' is up: $fhost <- $mylip"
 }
 
