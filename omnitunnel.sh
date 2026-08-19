@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.6"
+VERSION="2.7.7"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1065,11 +1065,12 @@ bench_run() {
     sleep 1
 
     echo; printf "%b\n" "${C_BOLD}Raw path (no tunnel):${C_RESET}"
-    local raw_dl raw_ping
+    local raw_dl raw_ul raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
         raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
-    else raw_dl="n/a (foreign 5599 not reachable directly)"; fi
+        raw_ul=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8    2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
+    else raw_dl="n/a (foreign 5599 not reachable directly)"; raw_ul="n/a"; fi
     printf "  download %s   rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
 
     # Auto-scale hysteria's Brutal-CC target to the measured raw path bandwidth.
@@ -1098,12 +1099,13 @@ bench_run() {
         if type_is_hysteria "$t"; then
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$hy_target' '$nc'" >/dev/null 2>&1
             create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$hy_target" "$nc"
-            # iperf3 is unreliable through the SOCKS5 relay, so hysteria is measured
-            # with a curl download of the foreign's file server (forwarded here).
-            printf 'tcp:5598\n' > "$(inst_pf "$name")"
+            # download = parallel curl of the foreign's file server (forwarded
+            # here on 5598); upload = iperf to the foreign's iperf server through
+            # a second relay on 5599. Both ride the SOCKS5.
+            printf 'tcp:5598\ntcp:5599\n' > "$(inst_pf "$name")"
             inst_enable "$name" >/dev/null 2>&1; pf_apply_all "$name" >/dev/null 2>&1
             # wait (bounded ~30s) until the QUIC tunnel actually carries data before measuring
-            local w hrtt hdl="" sz
+            local w hrtt hdl="" hul="" sz
             for w in $(seq 1 15); do
                 sz=$(curl -s -o /dev/null -w '%{size_download}' --max-time 3 "http://127.0.0.1:5598/omnibench.bin" 2>/dev/null || echo 0)
                 [[ "$sz" =~ ^[1-9] ]] && break
@@ -1111,7 +1113,8 @@ bench_run() {
             done
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
             hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
-            rows+=("$t|${hdl:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL}"
+            hul=$(timeout 25 iperf3 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+            rows+=("$t|${hdl:-FAIL}|${hul:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL} / up ${hul:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
             continue
@@ -1119,7 +1122,7 @@ bench_run() {
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
         inst_enable "$name" >/dev/null 2>&1; sleep 6
-        local out loss rtt dl
+        local out loss rtt dl ul
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
@@ -1127,8 +1130,12 @@ bench_run() {
         # if iperf couldn't measure but the tunnel is actually up (loss < 100),
         # fall back to a curl download through the tun to the foreign's file server
         [[ -z "$dl" && "${loss:-100}" != 100 ]] && dl=$(bench_curl_mbps "http://$pa:5598/omnibench.bin")
-        rows+=("$t|${dl:-FAIL}|${loss:-100}%|${rtt:-n/a}")
-        echo "${dl:-FAIL}"
+        # upload = same iperf WITHOUT -R (Iran -> foreign). 'receiver' is what the
+        # far side actually got, so a stalled/policed upload records FAIL instead
+        # of a phantom sender rate.
+        ul=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
+        echo "${dl:-FAIL} / up ${ul:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
     done
@@ -1141,7 +1148,7 @@ bench_run() {
     peer_ssh "$fhost" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
     set -e
 
-    ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
+    ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_UL="${raw_ul:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
     rule_green
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
@@ -1184,11 +1191,12 @@ cmd_bench_manual() {
     echo "   ${C_CYAN}bash <(curl -fsSL $RAW_BASE/install.sh)${C_RESET}"
     echo "   ${C_CYAN}omnitunnel bench-server $token${C_RESET}"
     read -erp "2) Press Enter here once it prints 'benchmark server ready'... " _
-    local raw_dl raw_ping
+    local raw_dl raw_ul raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
         raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
-    else raw_dl="n/a (foreign 5599 not reachable directly)"; fi
+        raw_ul=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8    2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
+    else raw_dl="n/a (foreign 5599 not reachable directly)"; raw_ul="n/a"; fi
     echo; printf "%b\n" "${C_BOLD}Measuring each tunnel...${C_RESET}"
     local rows=() i=0 t
     set +e   # best-effort measurement (see bench_run): never abort mid-run
@@ -1199,17 +1207,18 @@ cmd_bench_manual() {
         echo -n "  $t ... "
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" none 8
         inst_enable "$name" >/dev/null 2>&1; sleep 6
-        local out loss rtt dl
+        local out loss rtt dl ul
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
         dl=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
-        rows+=("$t|${dl:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL}"
+        ul=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL} / up ${ul:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         i=$((i+1))
     done
     set -e
-    ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
+    ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_UL="${raw_ul:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
     warn "on the FOREIGN server, remove the test tunnels with:  ${C_CYAN}omnitunnel bench-clean${C_RESET}"
     echo
     rule_green
@@ -1458,22 +1467,22 @@ _gt()   { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
 # RAW_PING. Marks the outright winner and, separately, the fastest fully
 # obfuscated transport - the distinction the whole run exists to answer.
 bench_table() {
-    local r t dl ls pg v max=0 sv=0 stealth="" sorted=() line
+    local r t dl ul ls pg v max=0 sv=0 stealth="" sorted=() line
     banner "Benchmark results"
     for r in "${ROWS[@]}"; do
-        IFS='|' read -r t dl ls pg <<< "$r"; v="$(_mbit "$dl")"
+        IFS='|' read -r t dl ul ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
         if _gt "$v" "$max"; then max="$v"; fi
         case "$t" in udp|tcp|mux|ws|hysteria|fou) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
     echo
-    printf '  %braw path (plain TCP, policed)%b   %b%s%b   rtt %b%s ms%b\n\n' \
-        "$C_GREY" "$C_RESET" "$C_WHITE" "${RAW_DL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_PING:-n/a}" "$C_RESET"
-    printf '    %b%-9s %-14s %-7s %-6s %s%b\n' "$C_GREY" "TYPE" "DOWNLOAD" "" "LOSS" "PING" "$C_RESET"
-    local first=1 n bar bc lcol lsc mark note dnum
+    printf '  %braw path (plain TCP, policed)%b   down %b%s%b / up %b%s%b   rtt %b%s ms%b\n\n' \
+        "$C_GREY" "$C_RESET" "$C_WHITE" "${RAW_DL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_UL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_PING:-n/a}" "$C_RESET"
+    printf '    %b%-9s %-14s %-9s %-7s %-6s %s%b\n' "$C_GREY" "TYPE" "DOWNLOAD" "UPLOAD" "" "LOSS" "PING" "$C_RESET"
+    local first=1 n bar bc lcol lsc ucol mark note dnum unum
     for line in "${sorted[@]}"; do
-        v="${line%%|*}"; r="${line#*|}"; IFS='|' read -r t dl ls pg <<< "$r"
+        v="${line%%|*}"; r="${line#*|}"; IFS='|' read -r t dl ul ls pg <<< "$r"
         n=$(awk -v a="$v" -v m="$max" 'BEGIN{ if (m<=0) {print 0; exit} k=int(14*a/m+0.5); if (k<1 && a>0) k=1; print k }')
         bar="$(_bar "$n")$(printf '%*s' $((14-n)) '')"
         bc="$C_BCYN"; lcol="$C_WHITE"; mark=" "; note=""
@@ -1482,9 +1491,12 @@ bench_table() {
         if _gt "$(awk -v m="$max" 'BEGIN{print m/50}')" "$v"; then bc="$C_GREY"; lcol="$C_GREY"; fi
         lsc="$C_BGRN"; [[ "$ls" != "0%" ]] && lsc="$C_BYEL"
         dnum="$dl"; [[ "$dl" == *bits/sec* ]] && dnum="${dl%% *}$(printf '%s' "${dl#* }" | cut -c1)"
-        printf '  %b%s%b %b%-9s%b %b%s%b %b%-7s%b %b%-6s%b %-5s %b%s%b\n' \
+        unum="$ul"; [[ "$ul" == *bits/sec* ]] && unum="${ul%% *}$(printf '%s' "${ul#* }" | cut -c1)"
+        ucol="$lcol"; [[ "$ul" == FAIL || "$ul" == n/a ]] && ucol="$C_BYEL"
+        printf '  %b%s%b %b%-9s%b %b%s%b %b%-7s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
             "$C_BGRN" "$mark" "$C_RESET" "$lcol" "$t" "$C_RESET" \
             "$bc" "$bar" "$C_RESET" "$lcol" "$dnum" "$C_RESET" \
+            "$ucol" "$unum" "$C_RESET" \
             "$lsc" "$ls" "$C_RESET" "$pg" "$C_GREY" "$note" "$C_RESET"
     done
     echo
