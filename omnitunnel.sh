@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.5"
+VERSION="2.7.6"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -492,6 +492,18 @@ EOF
 }
 cmd_postup() { load_inst "$1"; apply_tuning "$DEV" "$SHAPE"; pf_apply_all "$1" || true; }
 
+# Restart an instance's port-forward relays. A tunnel restart silently kills the
+# sockets a relay held open through the OLD tunnel; if the relay is not bounced,
+# an upstream proxy (mf-proxy etc.) that kept a long-lived connection alive
+# through the relay stays wedged on the dead socket and traffic degrades to
+# "very slow" instead of erroring cleanly. Bouncing the relays forces fresh
+# connections through the just-restarted tunnel.
+restart_pf_relays() {
+    local u
+    for u in $(systemctl list-units "omnitun-$1-pf-*.service" --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
+        systemctl restart "$u" 2>/dev/null || true
+    done
+}
 inst_enable() {
     need_root; load_inst "$1"; write_service "$1"
     systemctl enable "$(svc_name "$1")" >/dev/null 2>&1 || true
@@ -501,6 +513,7 @@ inst_enable() {
     systemctl restart "$(svc_name "$1")" 2>/dev/null \
         || warn "service $(svc_name "$1") did not start cleanly - see: journalctl -u $(svc_name "$1")"
     sleep 2; inst_status "$1" || true
+    restart_pf_relays "$1"   # drop stale relay connections to the old tunnel
 }
 inst_running() { systemctl is-active "$(svc_name "$1")" >/dev/null 2>&1; }
 inst_header() {

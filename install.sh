@@ -95,13 +95,23 @@ else
     [[ "$OLD_VER" == "$NEW_VER" ]] && echo "Refreshed OmniTunnel (v$NEW_VER)" || echo "Updated OmniTunnel  v$OLD_VER  ->  v$NEW_VER"
     if [[ "$core_changed" == 1 ]]; then
         # the core binary actually changed - restart running tunnels to pick it up.
-        # (Port-forward relays don't use the core binary, so skip them.)
         changed=0
         for u in $(systemctl list-units 'omnitun-*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
             case "$u" in *-pf-*.service) continue;; esac
             echo "  restarting $u"; systemctl restart "$u" 2>/dev/null || true; changed=1
         done
-        [[ "$changed" == 1 ]] && echo "Core updated - running tunnels restarted." || echo "Core updated - no running tunnels to restart."
+        # Then bounce the port-forward relays. They don't use the core binary, but
+        # the tunnel restart above silently killed the sockets they held open
+        # through the OLD tunnel; without this bounce an upstream proxy (mf-proxy
+        # etc.) that kept a long-lived connection alive through a relay stays
+        # wedged on the dead socket and traffic degrades to "very slow" instead of
+        # erroring cleanly. Restarting the relays reconnects through the fresh tunnel.
+        if [[ "$changed" == 1 ]]; then
+            for u in $(systemctl list-units 'omnitun-*-pf-*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
+                echo "  restarting relay $u"; systemctl restart "$u" 2>/dev/null || true
+            done
+        fi
+        [[ "$changed" == 1 ]] && echo "Core updated - running tunnels + relays restarted." || echo "Core updated - no running tunnels to restart."
     else
         echo "Manager/installer refreshed only; core unchanged, so running tunnels were left untouched."
     fi
