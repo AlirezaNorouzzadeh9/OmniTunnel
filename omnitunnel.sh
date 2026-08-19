@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.4"
+VERSION="2.7.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -995,7 +995,23 @@ bench_ensure_httpfile() {
 }
 # measure download speed of a URL and print it iperf-style ("NNN Mbits/sec"); empty on failure
 bench_curl_mbps() {
-    local bps; bps=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 "$1" 2>/dev/null || true)
+    # Sum 8 PARALLEL streams: a single download is window-limited on a high
+    # latency path (a 150 ms link needs a huge window one stream never fills), so
+    # one curl badly undersells a fast tunnel. The hysteria SOCKS relay is
+    # threaded (listen 256) so parallel streams aggregate. Fall back to a single
+    # stream if the parallel run yields nothing, so it is never worse than before.
+    local url="$1" i tot tmp m
+    tmp=$(mktemp -d 2>/dev/null)
+    if [[ -n "$tmp" ]]; then
+        for i in 1 2 3 4 5 6 7 8; do
+            ( curl -s -o /dev/null -w '%{speed_download}\n' --max-time 15 "$url" 2>/dev/null > "$tmp/$i" || true ) &
+        done
+        wait
+        tot=$(cat "$tmp"/* 2>/dev/null | awk '{s+=$1} END{print s+0}'); rm -rf "$tmp"
+        m=$(awk -v b="${tot:-0}" 'BEGIN{ printf "%.3g", b*8/1000000 }')
+        awk -v x="$m" 'BEGIN{ exit !(x+0 >= 0.05) }' && { printf "%s Mbits/sec" "$m"; return 0; }
+    fi
+    local bps; bps=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 15 "$url" 2>/dev/null || true)
     [[ -n "$bps" ]] || return 1
     awk -v b="$bps" 'BEGIN{ m=b*8/1000000; if(m<0.05) exit 1; printf "%.3g Mbits/sec", m }'
 }
@@ -1043,6 +1059,16 @@ bench_run() {
     else raw_dl="n/a (foreign 5599 not reachable directly)"; fi
     printf "  download %s   rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
 
+    # Auto-scale hysteria's Brutal-CC target to the measured raw path bandwidth.
+    # Brutal sends at its TARGET rate regardless of loss, so a fixed low target
+    # (the old hard-coded 200) capped hysteria at ~200 Mbit even on a 1-gig path
+    # (measured: 188 where fou/gre did ~1 Gbit). Use ~90% of the raw download,
+    # floored at 200 and capped at 2000 mbps. If raw couldn't be measured
+    # (n/a) this yields 200 - the old safe default.
+    local hy_target
+    hy_target=$(awk -v s="$raw_dl" 'BEGIN{ n=s+0; if (s ~ /Kbits/) n/=1000; else if (s ~ /Gbits/) n*=1000; t=int(n*0.9); if (t<200) t=200; if (t>2000) t=2000; print t }')
+    printf "  %bhysteria Brutal-CC target auto-scaled to %s mbps%b\n" "$C_GREY" "$hy_target" "$C_RESET"
+
     echo; printf "%b\n" "${C_BOLD}Benchmarking each tunnel (a few minutes)...${C_RESET}"
     local rows=() base; base=$(next_subnet_idx); local i=0 t
     # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
@@ -1057,8 +1083,8 @@ bench_run() {
         echo -n "  $t ... "
         # hysteria has no tun/ping: forward the iperf port through it and measure
         if type_is_hysteria "$t"; then
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '200' '$nc'" >/dev/null 2>&1
-            create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" 200 "$nc"
+            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$hy_target' '$nc'" >/dev/null 2>&1
+            create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$hy_target" "$nc"
             # iperf3 is unreliable through the SOCKS5 relay, so hysteria is measured
             # with a curl download of the foreign's file server (forwarded here).
             printf 'tcp:5598\n' > "$(inst_pf "$name")"
@@ -1113,7 +1139,7 @@ bench_run() {
     read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
     local nc=16 shape=none
     [[ "$keep" == mux ]] && { read -erp "mux links N [16]: " nc; nc="${nc:-16}"; read -erp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
-    [[ "$keep" == hysteria ]] && { read -erp "Brutal-CC target bandwidth mbps [200]: " shape; shape="${shape:-200}"; }
+    [[ "$keep" == hysteria ]] && { read -erp "Brutal-CC target bandwidth mbps [$hy_target]: " shape; shape="${shape:-$hy_target}"; }
     local fsub fport fnames
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
     fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
