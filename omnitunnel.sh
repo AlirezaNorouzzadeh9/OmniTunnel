@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.0"
+VERSION="2.9.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -118,7 +118,7 @@ ensure_chisel() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan"
+ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan reverse-mux"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
@@ -130,11 +130,14 @@ type_desc() {
         tcp)      echo "single TCP AEAD  (looks like one HTTPS connection)";;
         fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
         vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
+        reverse-mux) echo "ICMP-reply + single-flow MUX  (Iran->foreign relay: beats policed multi-flow UPLOAD)";;
         *) echo "";;
     esac
 }
-# gre/icmp/fou/vxlan are kernel/plaintext carriers - no PSK
-type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan ]]; }
+# gre/icmp/fou/vxlan are kernel/plaintext carriers - no PSK; reverse-mux rides icmp (no PSK either)
+type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan && "$1" != reverse-mux ]]; }
+# reverse-mux is icmp(reply)-under-the-hood + a chisel single-flow MUX layer
+type_is_revmux() { [[ "$1" == reverse-mux ]]; }
 # native kernel tunnels - no compiled core binary involved
 type_is_kernel() { [[ "$1" == gre || "$1" == fou || "$1" == vxlan ]]; }
 # Starting port for auto-allocation. udp/fou/vxlan carry REAL UDP, so keep them
@@ -169,6 +172,9 @@ load_inst() {
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
 create_inst() {
     local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}"
+    # reverse-mux IS icmp with the reply-type forced (its whole point is the
+    # reply-gated dodge), so default its ICMP_MODE to reply if unset.
+    [[ "$t" == reverse-mux && -z "$imode" ]] && imode=reply
     local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(echo "$n" | cksum | cut -c1-8)"
     mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
     cat > "$(inst_conf "$n")" <<EOF
@@ -222,6 +228,9 @@ build_execstart() {
         mux)  echo "$TSUITE_BIN mux -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
         ws)   echo "$TSUITE_BIN ws -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
         icmp) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag${ICMP_MODE:+ -r $ICMP_MODE}";;
+        # reverse-mux rides the icmp engine with the reply type forced; the chisel
+        # MUX layer lives in separate units (mux-add / mux-token), not here.
+        reverse-mux) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag -r ${ICMP_MODE:-reply}";;
     esac
 }
 
@@ -1177,6 +1186,16 @@ wizard_add() {
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
+    if type_is_revmux "$t"; then
+        echo; info "reverse-mux carries user traffic over ONE muxed flow. Add its first forward now"
+        info "(a public port on THIS relay -> a destination the FOREIGN can reach, e.g. its local proxy):"
+        local rp rdh rdp
+        read -erp "  Public port on this relay [443]: " rp; rp="${rp:-443}"
+        read -erp "  Destination host from the foreign [127.0.0.1]: " rdh; rdh="${rdh:-127.0.0.1}"
+        read -erp "  Destination port [443]: " rdp; rdp="${rdp:-443}"
+        cmd_mux_add "$kn" "$rp" "$rdh" "$rdp"
+        info "add more later with:  ${C_CYAN}omnitunnel mux-add $kn <pubport> <dsthost> <dstport>${C_RESET}"
+    fi
 }
 
 # Manual add: brings up the near side and prints a token to paste on the
@@ -1352,6 +1371,32 @@ bench_run() {
             rows+=("$t|${hdl:-FAIL}|${hul:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL} / up ${hul:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
+            continue
+        fi
+        # reverse-mux: icmp(reply) tunnel + chisel single-flow MUX. Measured THROUGH
+        # the mux public port (bench port -> foreign iperf 5599), so the row shows
+        # the muxed throughput - the whole point is that this holds up under the
+        # -P 8 parallelism where a raw icmp upload collapses on a policed path.
+        if type_is_revmux "$t"; then
+            local bport=$((20000 + sub))
+            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' reverse-mux server '$fhost' '$mylip' '$port' '' '$pa' '$ta' none '$nc' reply" >/dev/null 2>&1
+            create_inst "$name" reverse-mux client "$mylip" "$fhost" "$port" "" "$ta" "$pa" none "$nc" reply
+            inst_enable "$name" >/dev/null 2>&1; sleep 6
+            local rout rloss rrtt
+            rout=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
+            rrtt=$(echo "$rout" | awk -F'/' '/rtt|round-trip/{print $5}')
+            rloss=$(echo "$rout" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+            echo "$bport:127.0.0.1:5599" > "$(mux_conf "$name")"
+            mux_relay_reconcile "$name" >/dev/null 2>&1
+            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $(mux_token "$name")" >/dev/null 2>&1
+            sleep 4
+            local rdl rul
+            rdl=$(timeout 25 iperf3 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+            rul=$(timeout 25 iperf3 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8    2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+            rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
+            echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
+            inst_remove "$name" >/dev/null 2>&1
+            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-off '$name'; OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
             continue
         fi
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
