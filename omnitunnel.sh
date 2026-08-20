@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.8"
+VERSION="2.7.9"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -233,6 +233,10 @@ masquerade:
   proxy:
     url: https://$HY_MASQ_HOST/
     rewriteHost: true
+quic:
+  maxIdleTimeout: 90s
+  keepAlivePeriod: 5s
+  disablePathMTUDiscovery: true
 EOF
     else
         local bw; bw="$(hy_bw "$SHAPE")"
@@ -246,6 +250,10 @@ obfs:
   type: salamander
   salamander:
     password: $HY_OBFS
+quic:
+  maxIdleTimeout: 90s
+  keepAlivePeriod: 5s
+  disablePathMTUDiscovery: true
 bandwidth:
   up: ${bw} mbps
   down: ${bw} mbps
