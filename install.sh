@@ -40,16 +40,16 @@ OLD_CORE="$(sum_of /usr/local/bin/omnitun)"; OLD_HY="$(sum_of /usr/local/bin/hys
 # third-party repo on the box can't spew "403 / no longer signed" errors into the
 # output. When we do install, apt/yum noise is redirected away.
 missing=0
-for c in ip iptables iperf3 ssh sshpass curl python3; do
+for c in ip iptables iperf3 ssh sshpass curl python3 nc; do
     command -v "$c" >/dev/null 2>&1 || { missing=1; break; }
 done
 if [[ $missing == 1 ]]; then
     echo "installing dependencies..."
     if command -v apt-get >/dev/null; then
         apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y iproute2 iptables iperf3 openssh-client sshpass ca-certificates curl python3 >/dev/null 2>&1 || true
+        apt-get install -y iproute2 iptables iperf3 openssh-client sshpass ca-certificates curl python3 netcat-openbsd >/dev/null 2>&1 || true
     elif command -v yum >/dev/null; then
-        yum install -y iproute iptables iperf3 openssh-clients sshpass curl python3 >/dev/null 2>&1 || true
+        yum install -y iproute iptables iperf3 openssh-clients sshpass curl python3 nmap-ncat >/dev/null 2>&1 || true
     fi
 fi
 
