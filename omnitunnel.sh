@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.8.0"
+VERSION="2.9.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -35,6 +35,13 @@ BINLINK="/usr/local/bin/omnitunnel"   # the 'omnitunnel' command (symlink to thi
 # HTTP/3, with salamander obfs + website masquerade).
 HYSTERIA_BIN="/usr/local/bin/hysteria"
 HY_MASQ_HOST="www.bing.com"
+# chisel (Go, jpillora/chisel) is the single-flow reverse MUX used to collapse
+# many relay->foreign user connections into ONE tunnelled flow (see the mux
+# section). A policed/lossy path shreds many parallel flows on upload but carries
+# one sustained flow fast+stable, so muxing recovers the full rate. Shipped static
+# alongside the core; pulled via raw like the rest.
+CHISEL_BIN="/usr/local/bin/chisel"
+CHISEL_VER="1.10.1"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
 RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
@@ -86,6 +93,28 @@ ensure_hysteria() {
         chmod +x "$ASSET_DIR/bin/hysteria-$a"; cand="$ASSET_DIR/bin/hysteria-$a"
     fi
     install -m 0755 "$cand" "$HYSTERIA_BIN"
+}
+
+# locate this box's chisel binary (shipped in bin/, or downloadable)
+chisel_local_bin() {
+    local a="$1" d
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/chisel-$a" ]] && { echo "$d/chisel-$a"; return 0; }; done
+    return 1
+}
+# make sure /usr/local/bin/chisel exists for this CPU (ship-first, download-fallback)
+ensure_chisel() {
+    [[ -x "$CHISEL_BIN" ]] && return 0
+    local a; a="$(arch_tag)"; [[ "$a" == unknown ]] && die "unsupported CPU: $(uname -m)"
+    local cand; cand="$(chisel_local_bin "$a" || true)"
+    if [[ -z "$cand" ]]; then
+        info "  fetching chisel mux core for $a ..."
+        mkdir -p "$ASSET_DIR/bin"
+        curl -fsSL "https://github.com/jpillora/chisel/releases/download/v$CHISEL_VER/chisel_${CHISEL_VER}_linux_$a.gz" \
+            | gzip -d > "$ASSET_DIR/bin/chisel-$a" 2>/dev/null \
+            || die "could not obtain chisel-$a (no shipped copy and download failed)"
+        chmod +x "$ASSET_DIR/bin/chisel-$a"; cand="$ASSET_DIR/bin/chisel-$a"
+    fi
+    install -m 0755 "$cand" "$CHISEL_BIN"
 }
 
 # ------------------------------------------------------------ type registry ---
@@ -646,6 +675,169 @@ pf_flush_chain() {
     iptables -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
 }
 
+# ------------------------------------------------------------- mux (chisel) ---
+# A "muxed" forward funnels ALL of a relay's user connections for a public port
+# into ONE persistent flow (a chisel reverse tunnel) over the instance's tun link,
+# then out to a destination reachable from the foreign. Why: a policed/lossy
+# relay->foreign path shreds many parallel connections on upload (they collapse to
+# a few Mbit) but carries a single sustained flow fast+stable (near line-rate), so
+# collapsing everything into one flow recovers the full rate. The RELAY (this box)
+# runs the chisel SERVER bound to its OWN tun IP (reachable only over the tunnel,
+# never public); the FOREIGN runs the chisel CLIENT that opens one reverse listener
+# per mapping ON THE RELAY and forwards each to its <dest>. All forwards on an
+# instance share one server + one client = one flow.
+mux_conf() { echo "$INST_DIR/$1/mux.conf"; }        # lines: <pub_port>:<dest_host>:<dest_port>
+mux_svc()  { echo "omnitun-$1-mux.service"; }
+# deterministic control port from the instance subnet (10.201.<X>.y -> 9000+X);
+# bound to the tun IP so it is reachable only through the tunnel, never publicly.
+mux_ctrl_port() { load_inst "$1"; local x; x=$(echo "$TUN_ADDR" | grep -oE '10\.201\.[0-9]+' | grep -oE '[0-9]+$'); echo $(( 9000 + ${x:-0} )); }
+# base64 token carrying the relay tun IP + ctrl port + the full mapping set, for
+# the no-SSH path (paste on the foreign). Rebuilt from mux.conf each call.
+mux_token() {
+    load_inst "$1"; local ctrl; ctrl="$(mux_ctrl_port "$1")"
+    { printf 'MUX1|%s|%s|%s\n' "$1" "$TUN_ADDR" "$ctrl"; cat "$(mux_conf "$1")" 2>/dev/null; } | base64 | tr -d '\n'
+}
+# (re)write + (re)start the relay-side chisel SERVER for an instance; bounce it
+# only when its command actually changed (mappings live on the client, so adding
+# one never bounces the server). Torn down when no mappings remain.
+mux_relay_reconcile() {
+    load_inst "$1"; local mc u; mc="$(mux_conf "$1")"; u="$(mux_svc "$1")"
+    if [[ ! -s "$mc" ]]; then
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$u"; systemctl reset-failed "$u" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true; return 0
+    fi
+    ensure_chisel
+    local ctrl; ctrl="$(mux_ctrl_port "$1")"
+    local new="/etc/systemd/system/$u.new"
+    cat > "$new" <<EOF
+[Unit]
+Description=OmniTunnel chisel mux server $1 (relay)
+After=network-online.target $(svc_name "$1")
+Wants=$(svc_name "$1")
+
+[Service]
+Type=simple
+ExecStart=$CHISEL_BIN server --reverse --host $TUN_ADDR --port $ctrl
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if ! cmp -s "$new" "/etc/systemd/system/$u" 2>/dev/null; then
+        mv "$new" "/etc/systemd/system/$u"; systemctl daemon-reload
+        systemctl enable "$u" >/dev/null 2>&1 || true
+        systemctl restart "$u" >/dev/null 2>&1 || true
+    else
+        rm -f "$new"
+        systemctl is-active --quiet "$u" || { systemctl enable "$u" >/dev/null 2>&1 || true; systemctl start "$u" >/dev/null 2>&1 || true; }
+    fi
+    return 0
+}
+# foreign side: (re)write + (re)start the chisel CLIENT dialing the relay tun IP,
+# one reverse listener per mapping forwarding to its <dest>. Rebuilt wholesale from
+# the mapping set (idempotent).
+mux_client_apply() {
+    local inst="$1" relay_ip="$2" ctrl="$3"; shift 3
+    ensure_chisel
+    local args=() m ph dh dp
+    for m in "$@"; do
+        IFS=: read -r ph dh dp <<< "$m"
+        [[ "$ph" =~ ^[0-9]+$ && -n "$dh" && "$dp" =~ ^[0-9]+$ ]] || continue
+        args+=("R:0.0.0.0:$ph:$dh:$dp")
+    done
+    [[ ${#args[@]} -gt 0 ]] || die "no valid mux mappings"
+    local u; u="$(mux_svc "$inst")"
+    cat > "/etc/systemd/system/$u" <<EOF
+[Unit]
+Description=OmniTunnel chisel mux client $inst (foreign)
+After=network-online.target $(svc_name "$inst")
+Wants=$(svc_name "$inst")
+
+[Service]
+Type=simple
+ExecStart=$CHISEL_BIN client --keepalive 25s http://$relay_ip:$ctrl ${args[*]}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload; systemctl enable "$u" >/dev/null 2>&1 || true
+    systemctl restart "$u" >/dev/null 2>&1 || true
+}
+# tear down the mux service (either side) for an instance
+mux_remove() {
+    local u; u="$(mux_svc "$1")"
+    [[ -e "/etc/systemd/system/$u" ]] || return 0
+    systemctl disable --now "$u" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$u"; systemctl reset-failed "$u" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
+# push the current mapping set to the foreign: auto over SSH if we can log in,
+# else print the token to paste there.
+_mux_push_foreign() {
+    local inst="$1" fhost="$2" tok; tok="$(mux_token "$inst")"
+    _peer_creds "$fhost"
+    if [[ -n "${PEER_PASS:-}" ]] && peer_ssh "$fhost" true >/dev/null 2>&1; then
+        if peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $tok" >/dev/null 2>&1; then
+            ok "foreign ($fhost) mux client updated automatically"; return 0
+        fi
+        warn "auto-config over SSH failed - finish it on the foreign by hand:"
+    fi
+    echo "${C_BOLD}Run this on the FOREIGN ($fhost) to (re)apply the mux:${C_RESET}"
+    echo "  ${C_CYAN}omnitunnel mux-token $tok${C_RESET}"
+}
+# mux-add <inst> <public_port> <dest_host> <dest_port>
+cmd_mux_add() {
+    need_root; local inst="$1" pub="$2" dh="$3" dp="$4"
+    inst_exists "$inst" || die "no such instance: $inst"
+    [[ "$pub" =~ ^[0-9]+$ && "$dp" =~ ^[0-9]+$ && -n "$dh" ]] || die "usage: mux-add <inst> <public_port> <dest_host> <dest_port>"
+    load_inst "$inst"
+    [[ "$ROLE" == server ]] && die "run mux-add on the RELAY (client) side of '$inst', not the foreign"
+    local mc; mc="$(mux_conf "$inst")"
+    { grep -vE "^$pub:" "$mc" 2>/dev/null || true; } > "$mc.t"; mv "$mc.t" "$mc"
+    echo "$pub:$dh:$dp" >> "$mc"
+    mux_relay_reconcile "$inst"
+    ok "relay: public $pub muxed over '$inst' -> foreign $dh:$dp (one flow)"
+    _mux_push_foreign "$inst" "$PEER_IP"
+}
+# mux-del <inst> <public_port>
+cmd_mux_del() {
+    need_root; local inst="$1" pub="$2"
+    inst_exists "$inst" || die "no such instance: $inst"
+    load_inst "$inst"
+    local mc; mc="$(mux_conf "$inst")"
+    [[ -f "$mc" ]] && { { grep -vE "^$pub:" "$mc" 2>/dev/null || true; } > "$mc.t"; mv "$mc.t" "$mc"; }
+    mux_relay_reconcile "$inst"
+    ok "removed muxed forward $pub from '$inst'"
+    if [[ -s "$mc" ]]; then _mux_push_foreign "$inst" "$PEER_IP"
+    else
+        _peer_creds "$PEER_IP"
+        if [[ -n "${PEER_PASS:-}" ]] && peer_ssh "$PEER_IP" true >/dev/null 2>&1; then
+            peer_ssh "$PEER_IP" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-off '$inst'" >/dev/null 2>&1 || true
+        else echo "  No mappings left. On the FOREIGN run: ${C_CYAN}omnitunnel mux-off $inst${C_RESET}"; fi
+    fi
+}
+# mux-token <token>   (run on the FOREIGN) — bring up / refresh the chisel mux client
+cmd_mux_token() {
+    need_root
+    local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid mux token"
+    local head; head=$(printf '%s\n' "$dec" | head -1)
+    case "$head" in MUX1\|*) :;; *) die "invalid mux token";; esac
+    local _tag inst relay_ip ctrl; IFS='|' read -r _tag inst relay_ip ctrl <<< "$head"
+    [[ -n "$inst" && -n "$relay_ip" && -n "$ctrl" ]] || die "invalid mux token"
+    local maps=() ln
+    while IFS= read -r ln; do case "$ln" in MUX1\|*|'') :;; *) maps+=("$ln");; esac; done <<< "$dec"
+    [[ ${#maps[@]} -gt 0 ]] || die "mux token has no forwards"
+    mkdir -p "$INST_DIR/$inst"; printf '%s\n' "${maps[@]}" > "$(mux_conf "$inst")"
+    mux_client_apply "$inst" "$relay_ip" "$ctrl" "${maps[@]}"
+    ok "foreign mux client for '$inst' up: $relay_ip:$ctrl  (${#maps[@]} forward(s))"
+}
+# mux-off <inst>   (foreign) — remove the mux client for an instance
+cmd_mux_off() { need_root; mux_remove "$1"; rm -f "$(mux_conf "$1")" 2>/dev/null || true; ok "mux client for '$1' removed"; }
+
 # --------------------------------------------------------------- remove -------
 # Removes ONLY the named instance this tool created. Never touches /etc/icmptun
 # or any interface / unit it did not create.
@@ -653,6 +845,7 @@ inst_remove() {
     need_root; inst_exists "$1" || { warn "no such instance: $1"; return 0; }
     load_inst "$1"
     type_is_hysteria "$TYPE" && hy_remove_relays "$1"
+    mux_remove "$1"   # tear down any chisel mux server/client for this instance
     systemctl disable --now "$(svc_name "$1")" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$(svc_name "$1")"
     systemctl reset-failed "$(svc_name "$1")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
@@ -1657,11 +1850,15 @@ case "${1:-menu}" in
     _remove)          need_root; inst_remove "${2:?instance}";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           pf_del "${2:?}" "${3:?}";;
+    mux-add)          shift; cmd_mux_add "$@";;
+    mux-del)          shift; cmd_mux_del "$@";;
+    mux-token)        need_root; cmd_mux_token "${2:?token}";;
+    mux-off)          need_root; cmd_mux_off "${2:?instance}";;
     _postup)          cmd_postup "${2:?}";;
     _peercreate)      shift; cmd_peercreate "$@";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|update|uninstall]";;
 esac

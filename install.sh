@@ -62,6 +62,7 @@ if [[ -f "$(dirname "$0")/bin/omnitun-$ARCH" ]]; then
     cp "$SRC/bin/omnitun-$ARCH" "$DEST/bin/omnitun-$ARCH"
     cp "$SRC/omnitunnel.sh" "$DEST/omnitunnel.sh"
     [[ -f "$SRC/bin/hysteria-$ARCH" ]] && cp "$SRC/bin/hysteria-$ARCH" "$DEST/bin/hysteria-$ARCH"
+    [[ -f "$SRC/bin/chisel-$ARCH" ]] && cp "$SRC/bin/chisel-$ARCH" "$DEST/bin/chisel-$ARCH"
 else
     echo "downloading core + manager ..."
     # Cache-bust the raw CDN. A stale Fastly edge can otherwise hand back the
@@ -73,11 +74,13 @@ else
     curl -fsSL "${NOCACHE[@]}" "$RAW/bin/omnitun-$ARCH$CB" -o "$DEST/bin/omnitun-$ARCH"
     curl -fsSL "${NOCACHE[@]}" "$RAW/omnitunnel.sh$CB"      -o "$DEST/omnitunnel.sh"
     curl -fsSL "${NOCACHE[@]}" "$RAW/bin/hysteria-$ARCH$CB" -o "$DEST/bin/hysteria-$ARCH" || true
+    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/chisel-$ARCH$CB"   -o "$DEST/bin/chisel-$ARCH" || true
 fi
 
 chmod +x "$DEST/bin/omnitun-$ARCH" "$DEST/omnitunnel.sh"
 install -m 0755 "$DEST/bin/omnitun-$ARCH" /usr/local/bin/omnitun
 [[ -f "$DEST/bin/hysteria-$ARCH" ]] && { chmod +x "$DEST/bin/hysteria-$ARCH"; install -m 0755 "$DEST/bin/hysteria-$ARCH" /usr/local/bin/hysteria; }
+[[ -s "$DEST/bin/chisel-$ARCH" ]] && { chmod +x "$DEST/bin/chisel-$ARCH"; install -m 0755 "$DEST/bin/chisel-$ARCH" /usr/local/bin/chisel; }
 ln -sf "$DEST/omnitunnel.sh" "$BINLINK"
 
 NEW_VER="$(ver_of "$DEST/omnitunnel.sh" || true)"
