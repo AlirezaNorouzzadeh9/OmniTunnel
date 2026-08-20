@@ -52,6 +52,14 @@ static char *tun_name = "tun0";
 static int mtu = DEFAULT_MTU;
 static uint16_t ident = DEFAULT_IDENT;
 static int is_server = 0;
+/* Which ICMP type THIS end emits for its outbound tunnel data. -1 = derive from
+   role (server->Echo Reply, client->Echo Request), the classic behaviour. An
+   explicit -r reply|request overrides it, decoupling the ICMP type from the
+   client/server role so a box can emit Echo REPLY (type 0) even as the tunnel
+   initiator - needed on paths that drop inbound Echo Requests (type 8) but pass
+   Echo Replies. The far side accepts either ICMP type; the per-direction id is
+   the real tag (see decapsulate). */
+static int tx_type = -1;
 static int verbose = 0;
 static uint16_t local_ident, remote_ident;
 static struct in_addr local_ip, peer_ip;
@@ -106,7 +114,9 @@ static int encapsulate(const void *inner, int inner_len, uint16_t seq, out_pkt_t
        Echo Request as a fresh unsolicited connection subject to a
        stricter policy. Mirroring genuine request/reply semantics avoids
        that distinction entirely. */
-    icmp->type = is_server ? ICMP_ECHOREPLY : ICMP_ECHO;
+    /* Default type follows the role (server=reply, client=request); -r overrides. */
+    icmp->type = (tx_type >= 0) ? (uint8_t)tx_type
+                                : (is_server ? ICMP_ECHOREPLY : ICMP_ECHO);
     icmp->code = 0;
     icmp->un.echo.id = htons(local_ident);
     /* seq is scoped PER FLOW (see flow_key_t below), not a single tunnel-
@@ -153,8 +163,12 @@ static int decapsulate(const unsigned char *buf, int len,
        server's own dedicated reply id, it fails this check on its own;
        it is additionally suppressed at the iptables raw/OUTPUT layer
        (see deploy notes) so it never even reaches the wire. */
-    int want_type = is_server ? ICMP_ECHO : ICMP_ECHOREPLY;
-    if (icmp->type != want_type ||
+    /* Accept EITHER Echo Request (8) or Echo Reply (0) from the peer: with the
+       -r flag each end may emit either type, so the type alone no longer tells
+       us the role. The per-direction id (remote_ident) is the real tag - and it
+       also rejects the kernel's own auto-reply to an inbound Echo Request, which
+       mirrors the SENDER's id (never our remote_ident) rather than the peer's. */
+    if ((icmp->type != ICMP_ECHO && icmp->type != ICMP_ECHOREPLY) ||
         icmp->code != 0 || ntohs(icmp->un.echo.id) != remote_ident)
         return -1;
     int payload = len - (int)sizeof(*icmp);
@@ -662,6 +676,10 @@ static void usage(const char *arg0) {
         "  -s  server mode: answer with genuine Echo Reply (id+1) instead of\n"
         "      Echo Request (id). Run with -s on exactly one end; the other\n"
         "      end (client) is the default with no -s.\n"
+        "  -r  force emitted ICMP type: 'reply' (Echo Reply, type 0) or 'request'\n"
+        "      (Echo Request, type 8), independent of role. Use on the end that\n"
+        "      must reach a peer whose ingress drops one echo type. Default: by\n"
+        "      role (server=reply, client=request). The far side accepts either.\n"
         "  -v  verbose: log every packet (debug only, hurts throughput)\n"
         "\n"
         "The process brings its own interface up and assigns -A/-P itself - no\n"
@@ -676,7 +694,7 @@ int tun_main_icmp(int argc, char **argv) {
     unsigned tmp;
     struct in_addr tun_local_ip, tun_peer_ip;
 
-    while ((opt = getopt(argc, argv, "L:R:A:P:M:I:T:svh")) != -1) {
+    while ((opt = getopt(argc, argv, "L:R:A:P:M:I:T:r:svh")) != -1) {
         switch (opt) {
         case 'L':
             if (!inet_aton(optarg, &local_ip)) usage(argv[0]);
@@ -701,6 +719,13 @@ int tun_main_icmp(int argc, char **argv) {
             tun_name = optarg; break;
         case 's':
             is_server = 1; break;
+        case 'r':
+            /* Force the emitted ICMP type independently of role, for paths that
+               drop one echo type in one direction. */
+            if (!strcmp(optarg, "reply"))        tx_type = ICMP_ECHOREPLY;
+            else if (!strcmp(optarg, "request")) tx_type = ICMP_ECHO;
+            else usage(argv[0]);
+            break;
         case 'v':
             verbose = 1; break;
         default:
@@ -721,8 +746,11 @@ int tun_main_icmp(int argc, char **argv) {
     char local_str[16];
     strncpy(local_str, inet_ntoa(local_ip), sizeof(local_str) - 1);
     local_str[sizeof(local_str) - 1] = '\0';
-    printf("ICMPTUN: local %s <-> peer %s, MTU %d, role=%s, local_id 0x%04x, remote_id 0x%04x, dev %s\n",
+    int eff_type = (tx_type >= 0) ? tx_type : (is_server ? ICMP_ECHOREPLY : ICMP_ECHO);
+    printf("ICMPTUN: local %s <-> peer %s, MTU %d, role=%s, tx=%s%s, local_id 0x%04x, remote_id 0x%04x, dev %s\n",
            local_str, inet_ntoa(peer_ip), mtu, is_server ? "server" : "client",
+           eff_type == ICMP_ECHOREPLY ? "reply(0)" : "request(8)",
+           tx_type >= 0 ? " [forced]" : "",
            local_ident, remote_ident, tun_name);
 
     memset(&peer_addr, 0, sizeof(peer_addr));

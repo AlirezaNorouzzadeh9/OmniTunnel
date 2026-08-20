@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.7.9"
+VERSION="2.8.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -132,14 +132,14 @@ default_local_ip() { ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+
 
 load_inst() {
     local n="$1"; inst_exists "$n" || die "no such instance: $n"
-    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"
+    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""
     # shellcheck disable=SC1090
     source "$(inst_conf "$n")"; INAME="$n"
 }
 
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
 create_inst() {
-    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}"
+    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}"
     local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(echo "$n" | cksum | cut -c1-8)"
     mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
     cat > "$(inst_conf "$n")" <<EOF
@@ -155,6 +155,7 @@ DEV=$dev
 MTU=1400
 NCONN=$nc
 SHAPE=$shape
+ICMP_MODE=$imode
 EOF
 }
 
@@ -191,7 +192,7 @@ build_execstart() {
         tcp)  echo "$TSUITE_BIN tcp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -T $DEV -M $MTU";;
         mux)  echo "$TSUITE_BIN mux -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
         ws)   echo "$TSUITE_BIN ws -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
-        icmp) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag";;
+        icmp) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag${ICMP_MODE:+ -r $ICMP_MODE}";;
     esac
 }
 
@@ -833,7 +834,7 @@ guard_peer_downgrade() {
 
 # push the manager + the peer's own-arch binary, then bring up the server side
 provision_peer() {
-    local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}"
+    local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}" imode="${12:-}"
     local parch; parch=$(peer_ssh "$h" "uname -m" 2>/dev/null | tr -d '\r')
     case "$parch" in x86_64|amd64) parch=amd64;; aarch64|arm64) parch=arm64;; *) die "peer $h has unsupported CPU: $parch";; esac
     info "  far side is $parch; deploying engine + manager to $h ..."
@@ -852,13 +853,13 @@ provision_peer() {
         peer_scp "$h" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
         peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnitun-$parch; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun"
     fi
-    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc'"
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc' '$imode'"
 }
 cmd_peercreate() {
     need_root
     if type_is_hysteria "$2"; then ensure_hysteria
     elif ! type_is_kernel "$2"; then ensure_binary; fi
-    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
+    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}"
     inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
 }
 
@@ -883,8 +884,11 @@ cmd_add_auto() {
     case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$t" || key=""
-    provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
-    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
+    local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
+    for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
+    [[ "$t" == icmp ]] || { imode=""; pmode=""; }
+    provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode"
+    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost  (subnet 10.201.$sub.0/24, port/key $port)"
 }
 
@@ -903,10 +907,15 @@ cmd_add_manual() {
     inst_exists "$kn" && die "instance $kn exists"
     local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(next_port "${want_port:-$(( $(port_base "$t") + sub ))}"); key=$(gen_key); type_uses_key "$t" || key=""
-    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
+    # icmp: this end's emitted ICMP type (OMNITUN_ICMP_MODE) and the foreign end's
+    # (OMNITUN_ICMP_MODE_PEER), for paths that drop one echo type in one direction.
+    local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
+    for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
+    [[ "$t" == icmp ]] || { imode=""; pmode=""; }
+    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
-    local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" | base64 | tr -d '\n')
+    local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" | base64 | tr -d '\n')
     echo
     echo "${C_GREEN}${C_BOLD}Near (Iran) side '$kn' is up.${C_RESET}"
     echo "${C_BOLD}Now run these TWO lines on the FOREIGN server ($fhost):${C_RESET}"
@@ -921,8 +930,8 @@ cmd_add_manual() {
 cmd_server_token() {
     need_root
     local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid token"
-    local name t fhost mylip port key pta ppa shape nc
-    IFS='|' read -r name t fhost mylip port key pta ppa shape nc <<< "$dec"
+    local name t fhost mylip port key pta ppa shape nc pmode
+    IFS='|' read -r name t fhost mylip port key pta ppa shape nc pmode <<< "$dec"
     [[ -n "$name" && -n "$t" ]] || die "invalid token"
     if type_is_hysteria "$t"; then ensure_hysteria
     elif ! type_is_kernel "$t"; then ensure_binary; fi
@@ -932,7 +941,7 @@ cmd_server_token() {
     # Replace it, then verify the unit actually came up and roll back if it did
     # not, so the token stays retryable.
     inst_exists "$name" && { warn "instance '$name' already exists - replacing it"; inst_remove "$name" >/dev/null 2>&1 || true; }
-    create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc"
+    create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc" "$pmode"
     inst_enable "$name"
     if ! inst_running "$name"; then
         inst_remove "$name" >/dev/null 2>&1 || true
