@@ -1,0 +1,8 @@
+# Shell scripts MUST keep LF endings. A CRLF shebang makes Linux refuse the file
+# outright ("bad interpreter: /bin/bash^M"), and this repo is routinely edited on
+# Windows checkouts where core.autocrlf=true would otherwise convert them.
+*.sh text eol=lf
+
+# Prebuilt engines and images are binary - never line-ending convert them.
+bin/* -text
+*.png -text

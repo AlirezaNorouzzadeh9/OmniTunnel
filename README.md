@@ -6,20 +6,20 @@
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
 traffic policing and DPI.** Prebuilt static binaries, one English
-menu-driven manager, nine interchangeable tunnel transports, and any
+menu-driven manager, sixteen interchangeable tunnel transports, and any
 many-to-many topology you need.
 
 Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
 police, throttle, or block traffic very differently depending on the transport
 and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
-ICMP is now just one of the nine transports.)
+ICMP is now just one transport among many.)
 
 ---
 
-## Why nine transports?
+## Why so many transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
-**per-route and per-transport**, and it changes. OmniTunnel ships all nine and
+**per-route and per-transport**, and it changes. OmniTunnel ships them all and
 lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
@@ -33,6 +33,31 @@ lets you **benchmark them and keep the winner**:
 | `hysteria` | **Hysteria2 / QUIC** — bundled engine with the loss-agnostic *Brutal* congestion control, salamander obfuscation and a real website masquerade | UDP passes but is **rate-policed or lossy**: Brutal ignores the induced loss and pushes at a fixed rate, so a policed UDP path that crawls at a few Mbit for `udp` runs an order of magnitude faster here — while looking exactly like HTTP/3 |
 | `fou`  | **GRE-in-UDP** (Foo-over-UDP), native kernel tunnel (no key) — a GRE tunnel wrapped inside an ordinary UDP packet on a port you choose | You want GRE's near-line-rate speed but the ISP blocks raw protocol-47, or the carrier must **look like plain UDP** instead of a GRE tunnel |
 | `vxlan` | **VXLAN**, native kernel tunnel (no key) — Ethernet-in-UDP, the standard datacenter overlay | A kernel UDP carrier that blends in as ordinary overlay traffic; useful where `fou`'s GRE-in-UDP is fingerprinted but VXLAN is not |
+
+### GRE header variants
+
+The base GRE header is 4 bytes, and every optional field the kernel appends
+changes the shape a DPI box sees on the wire. These ship as separate transports
+so that when one shape gets fingerprinted and throttled you can benchmark the
+rest and keep whatever still runs. All of them are plaintext kernel carriers —
+same speed class as `gre`, same lack of encryption.
+
+| Mode | What it changes | Best when |
+|------|-----------------|-----------|
+| `gre-seq`  | adds the GRE **sequence** field (+4B) | the plain `gre` header shape is recognised and policed |
+| `gre-csum` | adds the GRE **checksum** field (+4B, small CPU cost) | as above, and a third shape is needed |
+| `gre-tos`  | marks the **outer** IP header **DSCP EF** (the class real VoIP uses) | the ISP runs a priority queue for voice traffic — sometimes a large win, often a no-op where the carrier rewrites DSCP at its edge |
+| `gretap`   | **Ethernet**-in-GRE instead of IP-in-GRE (L2, /24 addressing) | a different proto-47 payload shape; also needed if you want to bridge |
+| `fou-seq`  | `fou` with the sequence field on the inner GRE header | the plain `fou` shape is fingerprinted |
+| `gue`      | **GRE-in-GUE** — UDP encap with a different header than `fou` | `fou`'s UDP encapsulation is recognised but GUE is not |
+| `gretap-fou` | Ethernet-in-GRE hidden inside plain UDP | you need `gretap`'s payload shape but raw protocol-47 is blocked |
+
+> **These carriers do not encrypt anything.** A GRE "key" is a cleartext demux
+> tag from RFC 2890, not a password, and every GRE variant ships the **inner IP
+> header in the clear** — an observer sees your real inner source, destination
+> and ports. Only `udp`/`tcp`/`mux`/`ws` (XChaCha20-Poly1305) and `hysteria`
+> actually encrypt. Pick a GRE variant for speed on a link where the ISP polices
+> the encrypted carriers, and run something already encrypted inside it.
 
 Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
 protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
@@ -91,7 +116,7 @@ From the main menu choose **“Benchmark all tunnels & pick the best.”** Point
 at a foreign server (IP + SSH login) and it will:
 
 1. measure the **raw** path (download + rtt),
-2. bring up each of the nine tunnels in turn and measure **download, packet
+2. bring up each tunnel in turn and measure **download, packet
    loss and ping** through it,
 3. print a comparison table,
 4. **remove every test tunnel from both sides**, then let you keep exactly one

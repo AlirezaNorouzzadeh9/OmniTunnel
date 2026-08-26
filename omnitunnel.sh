@@ -118,10 +118,17 @@ ensure_chisel() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan reverse-mux"
+ALL_TYPES="gre gre-seq gre-csum gre-tos gretap icmp udp mux ws hysteria tcp fou fou-seq gue gretap-fou vxlan reverse-mux"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
+        gre-seq)  echo "GRE + sequence field  (different proto-47 header shape; dodges GRE fingerprints)";;
+        gre-csum) echo "GRE + checksum field  (another proto-47 header shape; slight CPU cost)";;
+        gre-tos)  echo "GRE marked DSCP EF  (looks like VoIP; some ISPs give it a priority queue)";;
+        gretap)   echo "GRETAP L2-over-GRE  (kernel; Ethernet inside proto-47)";;
+        fou-seq)  echo "GRE-in-UDP + sequence  (fou with a different inner GRE header)";;
+        gue)      echo "GRE-in-GUE  (kernel; UDP encap with a different header than fou)";;
+        gretap-fou) echo "GRETAP-in-UDP  (kernel; Ethernet-in-GRE hidden inside plain UDP)";;
         icmp)     echo "IP-over-ICMP  (blends in as ping; no key)";;
         udp)      echo "IP-over-UDP AEAD  (fastest where UDP is allowed)";;
         mux)      echo "multi-connection TCP  (N links; for UDP-blocking DPI)";;
@@ -134,19 +141,40 @@ type_desc() {
         *) echo "";;
     esac
 }
-# gre/icmp/fou/vxlan are kernel/plaintext carriers - no PSK; reverse-mux rides icmp (no PSK either)
-type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan && "$1" != reverse-mux ]]; }
+# The GRE family (incl. gretap and the fou/gue encapsulations), vxlan and icmp are
+# kernel/plaintext carriers - no PSK; reverse-mux rides icmp (no PSK either).
+# NB: a GRE "key" is a cleartext demux tag from RFC 2890, NOT a secret - these
+# transports carry the inner IP header in the clear. Only the AEAD types
+# (udp/tcp/mux/ws) and hysteria actually encrypt.
+type_uses_key() {
+    case "$1" in
+        icmp|reverse-mux|gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan) return 1;;
+        *) return 0;;
+    esac
+}
 # reverse-mux is icmp(reply)-under-the-hood + a chisel single-flow MUX layer
 type_is_revmux() { [[ "$1" == reverse-mux ]]; }
 # native kernel tunnels - no compiled core binary involved
-type_is_kernel() { [[ "$1" == gre || "$1" == fou || "$1" == vxlan ]]; }
+type_is_kernel() {
+    case "$1" in
+        gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan) return 0;;
+        *) return 1;;
+    esac
+}
+# kernel carriers whose device is Ethernet (L2), so the tunnel address is a /24 on
+# a broadcast link instead of a point-to-point `peer` address.
+type_is_l2() { case "$1" in gretap|gretap-*|vxlan) return 0;; *) return 1;; esac; }
 # Starting port for auto-allocation. udp/fou/vxlan carry REAL UDP, so keep them
 # well clear of the 51820-51899 WireGuard range that some ISPs (seen on IR mobile)
 # block wholesale - a UDP tunnel landing on 51821 there is silently dropped (this
 # bit the plain `udp` transport too). gre's "port" is only a GRE key, and
 # tcp/mux/ws are TCP, so those are unaffected and stay at 51820. hysteria runs its
 # own QUIC/443 masquerade and manages its own port.
-port_base() { case "$1" in udp|fou|vxlan) echo 28820;; *) echo 51820;; esac; }
+port_base() { case "$1" in udp|fou|fou-*|gue|gretap-fou|vxlan) echo 28820;; *) echo 51820;; esac; }
+# 1-based position of a type in ALL_TYPES, so a menu default can be pinned to a
+# NAME instead of a hardcoded number that silently shifts whenever a transport is
+# added ahead of it.
+type_index() { local i=1 x; for x in $ALL_TYPES; do [[ "$x" == "$1" ]] && { echo "$i"; return; }; i=$((i+1)); done; echo 1; }
 # hysteria is a separate engine: its own binary + YAML, no tun device, forwards
 # ports natively (no iptables DNAT). It gets special-cased throughout.
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
@@ -195,27 +223,66 @@ EOF
 }
 
 # ------------------------------------------------- kernel carrier commands ----
-# Native kernel tunnels (gre / fou / vxlan) are brought up with plain `ip`
-# commands - no core binary. PORT does double duty as the disambiguator so
+# Native kernel tunnels (the GRE family, fou/gue, vxlan) are brought up with plain
+# `ip` commands - no core binary. PORT does double duty as the disambiguator so
 # several tunnels can share one endpoint pair without colliding:
-#   gre   -> GRE key
-#   fou   -> FOU UDP port AND the inner GRE key (GRE hidden inside UDP)
-#   vxlan -> VXLAN VNI AND UDP dstport
+#   gre* / gretap        -> GRE key
+#   fou* / gue / gretap-fou -> UDP port AND the inner GRE key
+#   vxlan                -> VXLAN VNI AND UDP dstport
 # Called with an instance already loaded (DEV/LOCAL_IP/PEER_IP/... in scope).
+#
+# Why several GRE variants: the base GRE header is 4 bytes and every optional
+# field the kernel appends changes the shape a DPI box sees on the wire. They are
+# separate transports so that when one shape gets fingerprinted and throttled you
+# can benchmark the rest and keep whatever still runs:
+#   key   +4B  demux tag (RFC 2890) - always on, it is what separates instances
+#   seq   +4B  sequence number
+#   csum  +4B  GRE checksum (costs some CPU)
+#   tos        copies a fixed DSCP into the OUTER IP header
+# None of these add any secrecy: every GRE carrier here ships the inner IP header
+# in the clear, and the key is a cleartext tag, not a password.
+#
+# `tos` takes the full 8-bit TOS byte, NOT a DSCP number. DSCP EF is 46, which as
+# a TOS byte is 46<<2 = 0xb8; passing `tos 46` (an easy mistake, and one the
+# script this was modelled on makes) would actually select DSCP 11. EF is the
+# class real VoIP uses, so some ISPs put it in a low-latency priority queue -
+# worth benchmarking, though many carriers rewrite DSCP at their edge and it then
+# does nothing at all.
+GRE_TOS_EF="0xb8"
+
+# L2 carriers (gretap/vxlan) are broadcast links and take a /24; point-to-point
+# GRE takes a peer address.
+_kern_addr_cmd() {
+    if type_is_l2 "$TYPE"; then echo "ip addr add $TUN_ADDR/24 dev $DEV"
+    else echo "ip addr add $TUN_ADDR peer $PEER_ADDR dev $DEV"; fi
+}
 kernel_up_cmd() {
+    local mods="modprobe ip_gre 2>/dev/null" opts="key $PORT" link="gre" encap="" pre=""
+    # The FOU/GUE receive binding (ip fou add) is a global UDP:PORT -> decap rule.
+    # On some kernels 'ip fou del' is unreliable ("Invalid argument"), so we never
+    # delete it: 'ip fou add' is idempotent ("in use" is harmless), the binding
+    # survives restarts, and a reused port simply reuses the existing rule.
+    # Teardown only drops the device.
+    local foumod="modprobe fou 2>/dev/null; modprobe ip_gre 2>/dev/null"
+    local fou_bind="ip fou add port $PORT ipproto 47 2>/dev/null"
+    local fou_encap=" encap fou encap-sport $PORT encap-dport $PORT"
     case "$TYPE" in
-        gre)
-            echo "modprobe ip_gre 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type gre local $LOCAL_IP remote $PEER_IP ttl 255 key $PORT; ip addr add $TUN_ADDR peer $PEER_ADDR dev $DEV; ip link set $DEV up mtu $MTU";;
-        fou)
-            # The FOU receive binding (ip fou add) is a global UDP:PORT -> GRE
-            # decap rule. On this kernel 'ip fou del' is unreliable ("Invalid
-            # argument"), so we never delete it: 'ip fou add' is idempotent
-            # ("in use" is harmless), the binding survives restarts, and a reused
-            # port simply reuses the existing rule. Teardown only drops the device.
-            echo "modprobe fou 2>/dev/null; modprobe ip_gre 2>/dev/null; ip link del $DEV 2>/dev/null; ip fou add port $PORT ipproto 47 2>/dev/null; ip link add $DEV type gre local $LOCAL_IP remote $PEER_IP ttl 255 key $PORT encap fou encap-sport $PORT encap-dport $PORT; ip addr add $TUN_ADDR peer $PEER_ADDR dev $DEV; ip link set $DEV up mtu $MTU";;
+        gre)        ;;
+        gre-seq)    opts="key $PORT seq";;
+        gre-csum)   opts="key $PORT csum";;
+        gre-tos)    opts="key $PORT tos $GRE_TOS_EF";;
+        gretap)     link="gretap";;
+        fou)        mods="$foumod"; pre="$fou_bind"; encap="$fou_encap";;
+        fou-seq)    mods="$foumod"; pre="$fou_bind"; encap="$fou_encap"; opts="key $PORT seq";;
+        gue)        mods="$foumod"; pre="ip fou add port $PORT gue 2>/dev/null"
+                    encap=" encap gue encap-sport $PORT encap-dport $PORT";;
+        gretap-fou) mods="$foumod"; pre="$fou_bind"; encap="$fou_encap"; link="gretap";;
         vxlan)
-            echo "modprobe vxlan 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type vxlan id $PORT local $LOCAL_IP remote $PEER_IP dstport $PORT ttl 255; ip addr add $TUN_ADDR/24 dev $DEV; ip link set $DEV up mtu $MTU";;
+            echo "modprobe vxlan 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type vxlan id $PORT local $LOCAL_IP remote $PEER_IP dstport $PORT ttl 255; ip addr add $TUN_ADDR/24 dev $DEV; ip link set $DEV up mtu $MTU"
+            return;;
+        *) return;;
     esac
+    echo "$mods; ip link del $DEV 2>/dev/null;${pre:+ $pre;} ip link add $DEV type $link local $LOCAL_IP remote $PEER_IP ttl 255 $opts$encap; $(_kern_addr_cmd); ip link set $DEV up mtu $MTU"
 }
 kernel_down_cmd() { echo "ip link del $DEV 2>/dev/null"; }
 
@@ -1157,8 +1224,9 @@ wizard_add() {
     need_root; ensure_binary
     echo; echo "${C_BOLD}Add a tunnel  (this box = near side / client; far = foreign / server)${C_RESET}"
     local ci=1 types=() t
-    for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
-    read -erp "Tunnel type [1]: " ch; ch="${ch:-1}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
+    for t in $ALL_TYPES; do printf "  %d) %-11s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    local dfl; dfl=$(type_index gre)
+    read -erp "Tunnel type [$dfl]: " ch; ch="${ch:-$dfl}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
     local mylip; mylip="$(default_local_ip)"
     read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
@@ -1204,8 +1272,9 @@ wizard_add_manual() {
     need_root; ensure_binary
     echo; echo "${C_BOLD}Add a tunnel - MANUAL${C_RESET} ${C_DIM}(no SSH to the foreign; nothing touches port 22)${C_RESET}"
     local ci=1 types=() t
-    for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
-    read -erp "Tunnel type [2]: " ch; ch="${ch:-2}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
+    for t in $ALL_TYPES; do printf "  %d) %-11s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    local dfl; dfl=$(type_index icmp)   # manual mode = no SSH; icmp is the safe default
+    read -erp "Tunnel type [$dfl]: " ch; ch="${ch:-$dfl}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
     local mylip; mylip="$(default_local_ip)"
     read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
@@ -1432,7 +1501,7 @@ bench_run() {
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
     rule_green
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
-    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
+    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-11s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
     read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
@@ -1503,7 +1572,7 @@ cmd_bench_manual() {
     echo
     rule_green
     printf '  %bKeep one as a permanent instance?%b %b(sets up its own fresh token)%b ' "$C_BGRN" "$C_RESET" "$C_GREY" "$C_RESET"
-    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
+    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-11s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "  0) keep none"
     read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
