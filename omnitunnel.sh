@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.7"
+VERSION="2.9.8"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -305,7 +305,25 @@ kernel_up_cmd() {
     esac
     echo "$mods; ip link del $DEV 2>/dev/null;${pre:+ $pre;} ip link add $DEV type $link local $LOCAL_IP remote $PEER_IP ttl 255 $opts$encap; $(_kern_addr_cmd); ip link set $DEV up mtu $MTU"
 }
-kernel_down_cmd() { echo "ip link del $DEV 2>/dev/null"; }
+# Teardown. The fou/gue transports also hold a GLOBAL "UDP port -> decap" binding
+# that outlives the device, and it is not cosmetic: the port stays occupied, so a
+# later tunnel allocated the same port fails to come up with "RTNETLINK answers:
+# Address already in use". Observed for real - a leftover gue binding on 28824
+# from a removed tunnel blocked a geneve instance that was later given that port.
+#
+# The previous code deliberately never deleted it, on the grounds that `ip fou
+# del` is unreliable on some kernels. It was verified working on both ends of a
+# live pair (6.8/iproute2-6.1 and 5.15/iproute2-5.15), so it is now attempted -
+# best effort, errors swallowed, so a kernel where it really does fail still
+# tears the device down normally.
+kernel_down_cmd() {
+    local c="ip link del $DEV 2>/dev/null"
+    case "$TYPE" in
+        fou|fou-*|gue|gretap-fou) c="$c; ip fou del port $PORT 2>/dev/null || true";;
+    esac
+    echo "$c"
+}
+
 
 # ------------------------------------------------------- execstart builder ----
 build_execstart() {
@@ -948,6 +966,13 @@ inst_remove() {
     systemctl reset-failed "$(svc_name "$1")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
     systemctl daemon-reload 2>/dev/null || true
     pf_flush_chain "$1"; ip link del "$DEV" 2>/dev/null || true
+    # Belt and braces: ExecStop already drops the fou/gue port binding, but a unit
+    # that FAILED to start never runs ExecStop, and the binding it created would
+    # then sit there blocking that port for the next tunnel.
+    case "$TYPE" in
+        fou|fou-*|gue|gretap-fou) [[ -n "${PORT:-}" ]] && ip fou del port "$PORT" 2>/dev/null || true;;
+    esac
+
     rm -rf "$(inst_path "$1")"; ok "removed instance '$1'"
 }
 
