@@ -184,7 +184,21 @@ omnitunnel server-token <token>
 The `<token>` carries the key, port and addresses — the tunnel comes straight
 up. No SSH between the two boxes is ever used.
 
-**2. SOCKS5 proxy for provisioning.** If you already have a working SOCKS5 proxy
+**2. A non-standard SSH port on the foreign.** If the far side's sshd does not
+listen on 22, the add wizard and the benchmark both ask for it ("Far SSH port"),
+or set `OMNITUN_PEER_PORT` for the scripted path:
+
+```bash
+OMNITUN_PEER_PASS=... OMNITUN_PEER_PORT=2222 omnitunnel add-auto gre main <foreign_ip>
+```
+
+Leaving it blank keeps the previous behaviour exactly: no `-p` is passed, so the
+port is whatever ssh itself resolves — including a `Host`/`Port` entry in
+`~/.ssh/config`. That matters, because an explicit `-p 22` would override such an
+entry and silently break a foreign box that is only reachable through it.
+
+**3. SOCKS5 proxy for provisioning.**
+ If you already have a working SOCKS5 proxy
 on the Iran box, the auto setup can tunnel its SSH/SCP through it (as the
 original icmptun did) — save a peer with a proxy and the manager adds
 `ProxyCommand=nc -X 5 -x host:port` to every provisioning connection.

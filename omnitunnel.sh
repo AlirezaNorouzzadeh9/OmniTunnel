@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.4"
+VERSION="2.9.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1036,21 +1036,23 @@ peer_conf() { echo "$PEER_DIR/$1.conf"; }
 # Peer creds are stored base64-encoded and read back by a plain parser (never
 # 'source'd) - so a password with shell-special characters ($ # & ; ` ( ) space
 # quotes ...) is preserved exactly instead of being mangled (or worse, executed).
+# save_peer <host> <user> <pass> [socks5_proxy] [ssh_port]
 save_peer() {
     mkdir -p "$PEER_DIR"; chmod 700 "$PEER_DIR"
     { printf 'PEER_USER=%s\n' "$(printf '%s' "$2" | base64 | tr -d '\n')"
       printf 'PEER_PASS=%s\n' "$(printf '%s' "$3" | base64 | tr -d '\n')"
       [[ -n "${4:-}" ]] && printf 'PEER_PROXY=%s\n' "$(printf '%s' "$4" | base64 | tr -d '\n')"
+      [[ -n "${5:-}" ]] && printf 'PEER_PORT=%s\n' "$(printf '%s' "$5" | base64 | tr -d '\n')"
     } > "$(peer_conf "$1")"
     chmod 600 "$(peer_conf "$1")"
 }
 _peer_creds() {
-    PEER_USER=root; PEER_PASS=""; PEER_PROXY=""
+    PEER_USER=root; PEER_PASS=""; PEER_PROXY=""; PEER_PORT=""
     local f line k v; f="$(peer_conf "$1")"; [[ -f "$f" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" == *=* ]] || continue
         k="${line%%=*}"; v="$(printf '%s' "${line#*=}" | base64 -d 2>/dev/null)"
-        case "$k" in PEER_USER) PEER_USER="$v";; PEER_PASS) PEER_PASS="$v";; PEER_PROXY) PEER_PROXY="$v";; esac
+        case "$k" in PEER_USER) PEER_USER="$v";; PEER_PASS) PEER_PASS="$v";; PEER_PROXY) PEER_PROXY="$v";; PEER_PORT) PEER_PORT="$v";; esac
     done < "$f"
     [[ -n "$PEER_USER" ]] || PEER_USER=root
     return 0
@@ -1061,6 +1063,16 @@ _peer_creds() {
 # provisioning SSH/SCP around an ISP that blocks the foreign box's port 22 -
 # this only affects the outbound connection we make, never any server's sshd.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+# ssh takes -p for the port, scp takes -P. Only emitted when a port was actually
+# configured: passing an explicit -p 22 would OVERRIDE a matching Host entry in
+# ~/.ssh/config, silently breaking a foreign box whose sshd listens elsewhere and
+# is reached today only because that config maps it.
+_port_opts() {
+    PORT_OPT_SSH=(); PORT_OPT_SCP=()
+    [[ -n "${PEER_PORT:-}" ]] || return 0
+    PORT_OPT_SSH=(-p "$PEER_PORT"); PORT_OPT_SCP=(-P "$PEER_PORT")
+    return 0
+}
 _proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] || return 0
     # Route ONLY the control SSH/SCP to the foreign through a SOCKS5 proxy (for
     # DPI-blocked Iran<->foreign paths). The tunnel data never touches the proxy.
@@ -1073,15 +1085,15 @@ _proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] || return 0
         PROXY_OPTS=(-o "ProxyCommand=nc -X 5 -x $PEER_PROXY %h %p")
     fi
     return 0; }
-peer_ssh() { local h="$1"; shift; _peer_creds "$h"; _proxy_opts
+peer_ssh() { local h="$1"; shift; _peer_creds "$h"; _proxy_opts; _port_opts
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"
-    else ssh "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"; fi
+        sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" ${PORT_OPT_SSH[@]+"${PORT_OPT_SSH[@]}"} ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"
+    else ssh "${SSH_OPTS[@]}" ${PORT_OPT_SSH[@]+"${PORT_OPT_SSH[@]}"} ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"; fi
 }
-peer_scp() { local h="$1" s="$2" d="$3"; _peer_creds "$h"; _proxy_opts
+peer_scp() { local h="$1" s="$2" d="$3"; _peer_creds "$h"; _proxy_opts; _port_opts
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"
-    else scp "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"; fi
+        sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" ${PORT_OPT_SCP[@]+"${PORT_OPT_SCP[@]}"} ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"
+    else scp "${SSH_OPTS[@]}" ${PORT_OPT_SCP[@]+"${PORT_OPT_SCP[@]}"} ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"; fi
 }
 
 # dotted-version compare: succeeds (0) only if $1 is strictly newer than $2
@@ -1145,14 +1157,16 @@ cmd_peercreate() {
 
 # Non-interactive add for scripting/automation.
 # add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
+# Far-side SSH port: $OMNITUN_PEER_PORT (blank = let ssh/~/.ssh/config decide).
 # Far-side SSH password comes from a saved peer file or $OMNITUN_PEER_PASS
-# (+ optional $OMNITUN_PEER_USER, default root).
+# (+ optional $OMNITUN_PEER_USER default root, $OMNITUN_PEER_PORT for a
+# non-standard far-side sshd port, $OMNITUN_PEER_PROXY for a SOCKS5 hop).
 cmd_add_auto() {
     need_root; ensure_binary
     local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
     inst_exists "$kn" && die "instance $kn exists"
-    [[ -n "${OMNITUN_PEER_PASS:-}" || -n "${OMNITUN_PEER_PROXY:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "${OMNITUN_PEER_PASS:-}" "${OMNITUN_PEER_PROXY:-}"
+    [[ -n "${OMNITUN_PEER_PASS:-}" || -n "${OMNITUN_PEER_PROXY:-}" || -n "${OMNITUN_PEER_PORT:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "${OMNITUN_PEER_PASS:-}" "${OMNITUN_PEER_PROXY:-}" "${OMNITUN_PEER_PORT:-}"
     guard_peer_downgrade "$fhost"
     # Ask the foreign what it already runs, so a second Iran box to the SAME foreign
     # gets its own subnet/port/key (and doesn't reuse a name) instead of clobbering
@@ -1243,8 +1257,10 @@ wizard_add() {
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
     read -erp "Far SSH user [root]: " fu; fu="${fu:-root}"
     read -rsp "Far SSH password (blank = ssh key): " fp; echo
+    read -erp "Far SSH port [22, blank = default or whatever ~/.ssh/config says]: " fpt; fpt="${fpt:-${OMNITUN_PEER_PORT:-}}"
+    if [[ -n "$fpt" && ! "$fpt" =~ ^[0-9]+$ ]]; then warn "SSH port must be a number - ignoring '$fpt'"; fpt=""; fi
     read -erp "SOCKS5 proxy to reach the foreign, if the direct path is DPI-blocked (host:port, blank = direct): " fpx; fpx="${fpx:-${OMNITUN_PEER_PROXY:-}}"
-    { [[ -n "$fp" || -n "$fpx" ]]; } && save_peer "$fhost" "$fu" "$fp" "$fpx"
+    { [[ -n "$fp" || -n "$fpx" || -n "$fpt" ]]; } && save_peer "$fhost" "$fu" "$fp" "$fpx" "$fpt"
     guard_peer_downgrade "$fhost"
     read -erp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
     local nc=16 shape=none
@@ -1408,12 +1424,14 @@ bench_curl_mbps() {
 }
 bench_run() {
     need_root; ensure_binary
-    local fhost fu fp mylip x
+    local fhost fu fp fpt mylip x
     read -erp "Foreign server IP to benchmark against: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
     read -erp "Foreign SSH user [root]: " fu; fu="${fu:-root}"
     read -rsp "Foreign SSH password (blank = ssh key): " fp; echo
+    read -erp "Far SSH port [22, blank = default or whatever ~/.ssh/config says]: " fpt; fpt="${fpt:-${OMNITUN_PEER_PORT:-}}"
+    if [[ -n "$fpt" && ! "$fpt" =~ ^[0-9]+$ ]]; then warn "SSH port must be a number - ignoring '$fpt'"; fpt=""; fi
     read -erp "SOCKS5 proxy to reach the foreign, if the direct path is DPI-blocked (host:port, blank = direct): " fpx; fpx="${fpx:-${OMNITUN_PEER_PROXY:-}}"
-    { [[ -n "$fp" || -n "$fpx" ]]; } && save_peer "$fhost" "$fu" "$fp" "$fpx"
+    { [[ -n "$fp" || -n "$fpx" || -n "$fpt" ]]; } && save_peer "$fhost" "$fu" "$fp" "$fpx" "$fpt"
     mylip="$(default_local_ip)"; read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     guard_peer_downgrade "$fhost"
     command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
