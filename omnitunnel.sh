@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.10.1"
+VERSION="2.10.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -657,15 +657,29 @@ restart_pf_relays() {
         systemctl restart "$u" 2>/dev/null || true
     done
 }
+# OMNITUN_NO_BOOT=1 marks a throwaway instance: skip the work that only pays off
+# across a reboot, and skip the cosmetic settle before printing status. The
+# benchmark sets it on both sides. Measured per side: `systemctl enable` 1012 ms
+# and the old flat `sleep 2` 2009 ms, so ~6 s per benchmarked transport - about
+# two minutes over a full run - spent on a tunnel that is deleted a minute later.
 inst_enable() {
     need_root; load_inst "$1"; write_service "$1"
-    systemctl enable "$(svc_name "$1")" >/dev/null 2>&1 || true
+    [[ "${OMNITUN_NO_BOOT:-0}" == 1 ]] || systemctl enable "$(svc_name "$1")" >/dev/null 2>&1 || true
     # A failed unit start must NOT silently abort the whole (set -euo pipefail)
     # run - that reads as the tool "cancelling/disconnecting" with no message.
     # Warn and carry on; callers that care check inst_running afterwards.
     systemctl restart "$(svc_name "$1")" 2>/dev/null \
         || warn "service $(svc_name "$1") did not start cleanly - see: journalctl -u $(svc_name "$1")"
-    sleep 2; inst_status "$1" || true
+    # Poll instead of sleeping blind: the unit reports active in about 20 ms.
+    local w; for ((w=0; w<40; w++)); do
+        systemctl is-active --quiet "$(svc_name "$1")" && break
+        sleep 0.05
+    done
+    # The data path needs a moment longer than the unit does, and inst_status
+    # prints a ping. Keep that wait only when a human is going to read it - the
+    # benchmark does its own bench_wait_ready and throws this output away.
+    [[ "${OMNITUN_NO_BOOT:-0}" == 1 ]] || sleep 2
+    inst_status "$1" || true
     restart_pf_relays "$1"   # drop stale relay connections to the old tunnel
 }
 inst_running() { systemctl is-active "$(svc_name "$1")" >/dev/null 2>&1; }
@@ -1392,6 +1406,14 @@ wizard_add_manual() {
 # The reason goes through a FILE, not a variable: every call site captures the
 # rate with $(...), which runs in a subshell, so a variable set inside would be
 # discarded before the caller could read it.
+# How long each direction is measured. Was a fixed 12s with the first 4 omitted:
+# 8s of steady state per direction, ~28s per transport once connection setup and
+# the result exchange are counted - about 8 of the 21 minutes a full 18-transport
+# run took. 8s/2s keeps 6s of steady state, enough on a settled path, and takes
+# roughly a third off. Raise it when the link is jittery and you want the average
+# to mean something:   OMNITUN_BENCH_SECS=20 omnitunnel bench
+BENCH_SECS="${OMNITUN_BENCH_SECS:-8}"
+BENCH_OMIT="${OMNITUN_BENCH_OMIT:-2}"
 _BENCH_WHY_F="${TMPDIR:-/tmp}/omnitunnel-bench-why.$$"
 _bench_why() { cat "$_BENCH_WHY_F" 2>/dev/null; }
 _iperf_rx() {
@@ -1585,6 +1607,8 @@ bench_run() {
         printf '  %bbenchmarking %s of %s transports%b\n' "$C_GREY" "$(echo $bench_types | wc -w)" "$(echo $ALL_TYPES | wc -w)" "$C_RESET"
     fi
     local rows=() used_sub="$fsub" used_port="$fport"; local i=0 t
+    # Throwaway instances: skip boot symlinks and the cosmetic status settle.
+    local _saved_noboot="${OMNITUN_NO_BOOT:-}"; export OMNITUN_NO_BOOT=1
     # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
     # that times out, a far-side bring-up hiccup) must NOT abort the whole run
     # under 'set -e'. Relax it for the loop; each type just records FAIL instead.
@@ -1597,7 +1621,7 @@ bench_run() {
         echo -n "  $t ... "
         # hysteria has no tun/ping: forward the iperf port through it and measure
         if type_is_hysteria "$t"; then
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$hy_target' '$nc'" >/dev/null 2>&1
+            peer_ssh "$fhost" "OMNITUN_NO_BOOT=1 OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$hy_target' '$nc'" >/dev/null 2>&1
             create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$hy_target" "$nc"
             # download = parallel curl of the foreign's file server (forwarded
             # here on 5598); upload = iperf to the foreign's iperf server through
@@ -1625,7 +1649,7 @@ bench_run() {
         # -P 8 parallelism where a raw icmp upload collapses on a policed path.
         if type_is_revmux "$t"; then
             local bport=$((20000 + sub))
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' reverse-mux server '$fhost' '$mylip' '$port' '' '$pa' '$ta' none '$nc' reply" >/dev/null 2>&1
+            peer_ssh "$fhost" "OMNITUN_NO_BOOT=1 OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' reverse-mux server '$fhost' '$mylip' '$port' '' '$pa' '$ta' none '$nc' reply" >/dev/null 2>&1
             create_inst "$name" reverse-mux client "$mylip" "$fhost" "$port" "" "$ta" "$pa" none "$nc" reply
             inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
             local rout rloss rrtt
@@ -1637,22 +1661,22 @@ bench_run() {
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $(mux_token "$name")" >/dev/null 2>&1
             sleep 4
             local rdl rul
-            rdl=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8 -R)
-            rul=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8)
+            rdl=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8 -R)
+            rul=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
             rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
             echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-off '$name'; OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
             continue
         fi
-        peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
+        peer_ssh "$fhost" "OMNITUN_NO_BOOT=1 OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
         inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
         local out loss rtt dl
         out=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
+        dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8 -R)
         # if iperf couldn't measure but the tunnel is actually up (loss < 100),
         # fall back to a curl download through the tun to the foreign's file server
         [[ -z "$dl" && "${loss:-100}" != 100 ]] && dl=$(bench_curl_mbps "http://$pa:5598/omnibench.bin")
@@ -1669,7 +1693,7 @@ bench_run() {
             ulwhy=" (tunnel down)"
         else
             sleep 2
-            ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
+            ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
             [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
         fi
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
@@ -1755,8 +1779,8 @@ cmd_bench_manual() {
         out=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
-        ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
+        dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8 -R)
+        ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL} / up ${ul:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         i=$((i+1))
