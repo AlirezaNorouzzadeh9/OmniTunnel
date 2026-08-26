@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.2"
+VERSION="2.9.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1299,6 +1299,44 @@ wizard_add_manual() {
 }
 
 # ----------------------------------------------------------- benchmark --------
+# Run ONE iperf3 test and print the far end's 'receiver' rate ("NNN Mbits/sec"),
+# or nothing on failure with the reason left in BENCH_WHY.
+#
+# This replaces a pipeline that was repeated at a dozen call sites and threw the
+# diagnosis away. Three things it fixes:
+#  - stderr went to /dev/null, so "the server is busy running a test" was
+#    invisible. That is the usual cause of a whole column of FAILs: download and
+#    upload run back-to-back and iperf3 serves one test at a time, so the second
+#    one is refused. It is now detected and retried after a settle.
+#  - a direction that is genuinely stalled reports "0.00 bits/sec" with no K/M/G
+#    suffix, which the old '[KMG]bits/sec' regex could not match - so a real
+#    zero was indistinguishable from "could not measure".
+#  - a bare timeout kill (exit 124) is now reported as such.
+# The reason goes through a FILE, not a variable: every call site captures the
+# rate with $(...), which runs in a subshell, so a variable set inside would be
+# discarded before the caller could read it.
+_BENCH_WHY_F="${TMPDIR:-/tmp}/omnitunnel-bench-why.$$"
+_bench_why() { cat "$_BENCH_WHY_F" 2>/dev/null; }
+_iperf_rx() {
+    local to="$1"; shift
+    local out rc v i why=""
+    : > "$_BENCH_WHY_F"
+    for i in 1 2; do
+        out="$(timeout "$to" iperf3 "$@" 2>&1)"; rc=$?
+        v="$(printf '%s\n' "$out" | grep -oE '[0-9.]+ [KMGT]?bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')"
+        if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
+        if printf '%s' "$out" | grep -q 'busy running a test'; then
+            why="server busy"; printf '%s' "$why" > "$_BENCH_WHY_F"; sleep 3; continue
+        fi
+        why="$(printf '%s\n' "$out" | grep -m1 -oE 'error - .*' | sed 's/^error - //')"
+        [[ -z "$why" && "$rc" == 124 ]] && why="timed out"
+        [[ -z "$why" ]] && why="no result"
+        printf '%s' "$why" > "$_BENCH_WHY_F"
+        return 1
+    done
+    [[ -s "$_BENCH_WHY_F" ]] || printf 'no result' > "$_BENCH_WHY_F"
+    return 1
+}
 # The measurement server (iperf3) MUST be listening on :5599 on the foreign, or
 # every tunnel measures nothing and the table is all-FAIL. Ensure it is up (or
 # report clearly why it can't be) so the user isn't left guessing.
@@ -1402,8 +1440,8 @@ bench_run() {
     local raw_dl raw_ul raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
-        raw_ul=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8    2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
+        raw_dl=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R || true)
+        raw_ul=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; raw_ul="n/a"; fi
     printf "  download %s   rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
 
@@ -1447,7 +1485,7 @@ bench_run() {
             done
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
             hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
-            hul=$(timeout 25 iperf3 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+            hul=$(_iperf_rx 25 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8)
             rows+=("$t|${hdl:-FAIL}|${hul:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL} / up ${hul:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
@@ -1471,8 +1509,8 @@ bench_run() {
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $(mux_token "$name")" >/dev/null 2>&1
             sleep 4
             local rdl rul
-            rdl=$(timeout 25 iperf3 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
-            rul=$(timeout 25 iperf3 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8    2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+            rdl=$(_iperf_rx 25 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8 -R)
+            rul=$(_iperf_rx 25 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8)
             rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
             echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
             inst_remove "$name" >/dev/null 2>&1
@@ -1486,16 +1524,21 @@ bench_run() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        dl=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
         # if iperf couldn't measure but the tunnel is actually up (loss < 100),
         # fall back to a curl download through the tun to the foreign's file server
         [[ -z "$dl" && "${loss:-100}" != 100 ]] && dl=$(bench_curl_mbps "http://$pa:5598/omnibench.bin")
         # upload = same iperf WITHOUT -R (Iran -> foreign). 'receiver' is what the
         # far side actually got, so a stalled/policed upload records FAIL instead
         # of a phantom sender rate.
-        ul=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        # iperf3 serves ONE test at a time; without this settle the upload run
+        # lands while the server is still tearing the download down and every
+        # upload in the table comes back FAIL.
+        sleep 2
+        ul=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
+        local ulwhy=""; [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
-        echo "${dl:-FAIL} / up ${ul:-FAIL}"
+        echo "${dl:-FAIL} / up ${ul:-FAIL}${ulwhy}"
         inst_remove "$name" >/dev/null 2>&1
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
     done
@@ -1559,8 +1602,8 @@ cmd_bench_manual() {
     local raw_dl raw_ul raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
-        raw_ul=$(timeout 20 iperf3 -c "$fhost" -p 5599 -t 6 -O 2 -P 8    2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}' || true)
+        raw_dl=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R || true)
+        raw_ul=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; raw_ul="n/a"; fi
     echo; printf "%b\n" "${C_BOLD}Measuring each tunnel...${C_RESET}"
     local rows=() i=0 t
@@ -1576,8 +1619,8 @@ cmd_bench_manual() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
-        ul=$(timeout 25 iperf3 -c "$pa" -p 5599 -t 12 -O 4 -P 8 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
+        dl=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
+        ul=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL} / up ${ul:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         i=$((i+1))
@@ -1825,7 +1868,7 @@ keyhint() { printf '\n'; rule; printf '  %b%s%b\n' "$C_GREY" "$1" "$C_RESET"; }
 prompt() { printf '\n  %b❯%b ' "$C_BCYN$C_BOLD" "$C_RESET"; }
 # ------------------------------------------------------- benchmark table ------
 # "652 Mbits/sec" / "870 Kbits/sec" / "1.2 Gbits/sec" -> a plain mbit number
-_mbit() { awk -v s="$1" 'BEGIN{ n=s+0; if (s ~ /Kbits/) n/=1000; else if (s ~ /Gbits/) n*=1000; if (s !~ /[0-9]/) n=0; printf "%.6g", n }'; }
+_mbit() { awk -v s="$1" 'BEGIN{ n=s+0; if (s ~ /Gbits/) n*=1000; else if (s ~ /Mbits/) n=n; else if (s ~ /Kbits/) n/=1000; else if (s ~ /bits\/sec/) n/=1000000; if (s !~ /[0-9]/) n=0; printf "%.6g", n }'; }
 _bar()  { local n="$1" i s=""; for ((i=0;i<n;i++)); do s="${s}█"; done; printf '%s' "$s"; }
 _gt()   { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
 # Sorted, bar-charted results. Reads ROWS[] (type|download|loss|ping), RAW_DL,
