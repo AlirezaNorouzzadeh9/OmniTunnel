@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.3"
+VERSION="2.9.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1323,6 +1323,14 @@ _iperf_rx() {
     : > "$_BENCH_WHY_F"
     for i in 1 2; do
         out="$(timeout "$to" iperf3 "$@" 2>&1)"; rc=$?
+        # A killed run still prints a summary, but the receiver figure in it is a
+        # placeholder ("0.00 bits/sec") because the server's real result never
+        # arrived. Trusting it would report a policed path as a hard zero, so a
+        # timeout is always a failure no matter what got printed.
+        if [[ "$rc" == 124 ]]; then
+            printf 'timed out (raise the timeout: this path needs longer than %ss)' "$to" > "$_BENCH_WHY_F"
+            return 1
+        fi
         v="$(printf '%s\n' "$out" | grep -oE '[0-9.]+ [KMGT]?bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')"
         if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
         if printf '%s' "$out" | grep -q 'busy running a test'; then
@@ -1440,8 +1448,8 @@ bench_run() {
     local raw_dl raw_ul raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R || true)
-        raw_ul=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 || true)
+        raw_dl=$(_iperf_rx 45 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R || true)
+        raw_ul=$(_iperf_rx 45 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; raw_ul="n/a"; fi
     printf "  download %s   rtt %s ms\n" "${raw_dl:-n/a}" "${raw_ping:-n/a}"
 
@@ -1485,7 +1493,7 @@ bench_run() {
             done
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
             hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
-            hul=$(_iperf_rx 25 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8)
+            hul=$(_iperf_rx 75 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8)
             rows+=("$t|${hdl:-FAIL}|${hul:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL} / up ${hul:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
@@ -1509,8 +1517,8 @@ bench_run() {
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $(mux_token "$name")" >/dev/null 2>&1
             sleep 4
             local rdl rul
-            rdl=$(_iperf_rx 25 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8 -R)
-            rul=$(_iperf_rx 25 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8)
+            rdl=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8 -R)
+            rul=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8)
             rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
             echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
             inst_remove "$name" >/dev/null 2>&1
@@ -1524,7 +1532,7 @@ bench_run() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
+        dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
         # if iperf couldn't measure but the tunnel is actually up (loss < 100),
         # fall back to a curl download through the tun to the foreign's file server
         [[ -z "$dl" && "${loss:-100}" != 100 ]] && dl=$(bench_curl_mbps "http://$pa:5598/omnibench.bin")
@@ -1535,7 +1543,7 @@ bench_run() {
         # lands while the server is still tearing the download down and every
         # upload in the table comes back FAIL.
         sleep 2
-        ul=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
+        ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
         local ulwhy=""; [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
         echo "${dl:-FAIL} / up ${ul:-FAIL}${ulwhy}"
@@ -1602,8 +1610,8 @@ cmd_bench_manual() {
     local raw_dl raw_ul raw_ping
     raw_ping=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}' || true)
     if nc -z -w4 "$fhost" 5599 2>/dev/null; then
-        raw_dl=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R || true)
-        raw_ul=$(_iperf_rx 20 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 || true)
+        raw_dl=$(_iperf_rx 45 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 -R || true)
+        raw_ul=$(_iperf_rx 45 -c "$fhost" -p 5599 -t 6 -O 2 -P 8 || true)
     else raw_dl="n/a (foreign 5599 not reachable directly)"; raw_ul="n/a"; fi
     echo; printf "%b\n" "${C_BOLD}Measuring each tunnel...${C_RESET}"
     local rows=() i=0 t
@@ -1619,8 +1627,8 @@ cmd_bench_manual() {
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-        dl=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
-        ul=$(_iperf_rx 25 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
+        dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
+        ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL} / up ${ul:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
         i=$((i+1))
