@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.6"
+VERSION="2.9.7"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -118,7 +118,7 @@ ensure_chisel() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre gre-seq gre-csum gre-tos gretap icmp udp mux ws hysteria tcp fou fou-seq gue gretap-fou vxlan reverse-mux"
+ALL_TYPES="gre gre-seq gre-csum gre-tos gretap icmp udp mux ws hysteria tcp fou fou-seq gue gretap-fou vxlan geneve reverse-mux"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
@@ -137,6 +137,7 @@ type_desc() {
         tcp)      echo "single TCP AEAD  (looks like one HTTPS connection)";;
         fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
         vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
+        geneve)   echo "GENEVE L2-over-UDP  (kernel; the other datacenter overlay - different header than VXLAN)";;
         reverse-mux) echo "ICMP-reply + single-flow MUX  (Iran->foreign relay: beats policed multi-flow UPLOAD)";;
         *) echo "";;
     esac
@@ -148,7 +149,7 @@ type_desc() {
 # (udp/tcp/mux/ws) and hysteria actually encrypt.
 type_uses_key() {
     case "$1" in
-        icmp|reverse-mux|gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan) return 1;;
+        icmp|reverse-mux|gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan|geneve) return 1;;
         *) return 0;;
     esac
 }
@@ -157,20 +158,20 @@ type_is_revmux() { [[ "$1" == reverse-mux ]]; }
 # native kernel tunnels - no compiled core binary involved
 type_is_kernel() {
     case "$1" in
-        gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan) return 0;;
+        gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan|geneve) return 0;;
         *) return 1;;
     esac
 }
 # kernel carriers whose device is Ethernet (L2), so the tunnel address is a /24 on
 # a broadcast link instead of a point-to-point `peer` address.
-type_is_l2() { case "$1" in gretap|gretap-*|vxlan) return 0;; *) return 1;; esac; }
+type_is_l2() { case "$1" in gretap|gretap-*|vxlan|geneve) return 0;; *) return 1;; esac; }
 # Starting port for auto-allocation. udp/fou/vxlan carry REAL UDP, so keep them
 # well clear of the 51820-51899 WireGuard range that some ISPs (seen on IR mobile)
 # block wholesale - a UDP tunnel landing on 51821 there is silently dropped (this
 # bit the plain `udp` transport too). gre's "port" is only a GRE key, and
 # tcp/mux/ws are TCP, so those are unaffected and stay at 51820. hysteria runs its
 # own QUIC/443 masquerade and manages its own port.
-port_base() { case "$1" in udp|fou|fou-*|gue|gretap-fou|vxlan) echo 28820;; *) echo 51820;; esac; }
+port_base() { case "$1" in udp|fou|fou-*|gue|gretap-fou|vxlan|geneve) echo 28820;; *) echo 51820;; esac; }
 # "Fully obfuscated" carriers - nothing on the wire says "tunnel". The AEAD types
 # and hysteria qualify because they are encrypted and shapeless; the fou/gue
 # family qualifies because the GRE tunnel is hidden inside ordinary UDP. Raw
@@ -290,6 +291,15 @@ kernel_up_cmd() {
         gretap-fou) mods="$foumod"; pre="$fou_bind"; encap="$fou_encap"; link="gretap";;
         vxlan)
             echo "modprobe vxlan 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type vxlan id $PORT local $LOCAL_IP remote $PEER_IP dstport $PORT ttl 255; ip addr add $TUN_ADDR/24 dev $DEV; ip link set $DEV up mtu $MTU"
+            return;;
+        geneve)
+            # GENEVE takes NO `local` - iproute2 rejects it outright, so the outer
+            # source address is whatever routing picks. On a multi-homed box that
+            # may not be LOCAL_IP; there is no kernel knob for it here.
+            # Like vxlan the device is Ethernet (link/ether, ARP on), so it takes
+            # a /24 rather than a peer address. PORT doubles as the VNI and the
+            # UDP dstport, same as vxlan.
+            echo "modprobe geneve 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type geneve id $PORT remote $PEER_IP dstport $PORT ttl 255; ip addr add $TUN_ADDR/24 dev $DEV; ip link set $DEV up mtu $MTU"
             return;;
         *) return;;
     esac

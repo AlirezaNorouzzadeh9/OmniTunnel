@@ -33,6 +33,7 @@ lets you **benchmark them and keep the winner**:
 | `hysteria` | **Hysteria2 / QUIC** — bundled engine with the loss-agnostic *Brutal* congestion control, salamander obfuscation and a real website masquerade | UDP passes but is **rate-policed or lossy**: Brutal ignores the induced loss and pushes at a fixed rate, so a policed UDP path that crawls at a few Mbit for `udp` runs an order of magnitude faster here — while looking exactly like HTTP/3 |
 | `fou`  | **GRE-in-UDP** (Foo-over-UDP), native kernel tunnel (no key) — a GRE tunnel wrapped inside an ordinary UDP packet on a port you choose | You want GRE's near-line-rate speed but the ISP blocks raw protocol-47, or the carrier must **look like plain UDP** instead of a GRE tunnel |
 | `vxlan` | **VXLAN**, native kernel tunnel (no key) — Ethernet-in-UDP, the standard datacenter overlay | A kernel UDP carrier that blends in as ordinary overlay traffic; useful where `fou`'s GRE-in-UDP is fingerprinted but VXLAN is not |
+| `geneve` | **GENEVE**, native kernel tunnel (no key) — the other standard datacenter overlay, Ethernet-in-UDP with a different (extensible) header than VXLAN | VXLAN itself is fingerprinted; GENEVE is the same idea on a different wire shape. Note the kernel gives GENEVE no `local` option, so the outer source address is whatever routing picks |
 
 ### GRE header variants
 
