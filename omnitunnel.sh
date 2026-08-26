@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.9"
+VERSION="2.10.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1106,7 +1106,24 @@ _peer_creds() {
 # password or an ssh key, not TOFU. An optional saved SOCKS5 proxy routes the
 # provisioning SSH/SCP around an ISP that blocks the foreign box's port 22 -
 # this only affects the outbound connection we make, never any server's sshd.
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+# ControlMaster keeps ONE authenticated connection open and runs every later
+# peer_ssh/peer_scp over it. Measured on a live Iran->Turkey link: a fresh
+# connection costs 2610 ms, a reused one 193 ms. A benchmark makes roughly 55 of
+# these calls, so the reuse alone takes ~2 minutes off the run, and add/remove
+# feel immediate instead of stalling for two seconds per step.
+# Safe here because every caller is sequential - the script this idea came from
+# hit silent failures only when it fired several calls at one socket in parallel.
+SSH_MUX_DIR="${TMPDIR:-/tmp}/omnitunnel-ssh"
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+          -o ControlMaster=auto -o "ControlPath=$SSH_MUX_DIR/%r@%h:%p" -o ControlPersist=180)
+mkdir -p "$SSH_MUX_DIR" 2>/dev/null; chmod 700 "$SSH_MUX_DIR" 2>/dev/null
+# Drop the shared connection - call before a long idle or at the end of a run so
+# no authenticated socket is left lying around.
+peer_ssh_close() {
+    local h="$1"; _peer_creds "$h"; _port_opts
+    ssh "${SSH_OPTS[@]}" ${PORT_OPT_SSH[@]+"${PORT_OPT_SSH[@]}"} -O exit "$PEER_USER@$h" >/dev/null 2>&1 || true
+}
+
 # ssh takes -p for the port, scp takes -P. Only emitted when a port was actually
 # configured: passing an explicit -p 22 would OVERRIDE a matching Host entry in
 # ~/.ssh/config, silently breaking a foreign box whose sshd listens elsewhere and
@@ -1408,7 +1425,21 @@ _iperf_rx() {
 # The measurement server (iperf3) MUST be listening on :5599 on the foreign, or
 # every tunnel measures nothing and the table is all-FAIL. Ensure it is up (or
 # report clearly why it can't be) so the user isn't left guessing.
+# Wait until the tunnel actually carries traffic, up to <timeout> seconds.
+# Replaces a flat `sleep 6`, which was wrong in both directions: a kernel carrier
+# is usable in well under a second, while mux and ws have to establish N links
+# (ws with an HTTP handshake on each) and were being measured before they were
+# ready, understating them. Returns as soon as a ping comes back.
+bench_wait_ready() {
+    local pa="$1" limit="${2:-20}" i
+    for ((i=0; i<limit*2; i++)); do
+        ping -c1 -W1 "$pa" >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    return 1
+}
 bench_ensure_iperf() {
+
     local h="$1" i
     # fast path: already listening
     peer_ssh "$h" "timeout 12 sh -c 'ss -lntu 2>/dev/null | grep -qw 5599'" && return 0
@@ -1582,7 +1613,7 @@ bench_run() {
             local bport=$((20000 + sub))
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' reverse-mux server '$fhost' '$mylip' '$port' '' '$pa' '$ta' none '$nc' reply" >/dev/null 2>&1
             create_inst "$name" reverse-mux client "$mylip" "$fhost" "$port" "" "$ta" "$pa" none "$nc" reply
-            inst_enable "$name" >/dev/null 2>&1; sleep 6
+            inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
             local rout rloss rrtt
             rout=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
             rrtt=$(echo "$rout" | awk -F'/' '/rtt|round-trip/{print $5}')
@@ -1602,8 +1633,8 @@ bench_run() {
         fi
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
-        inst_enable "$name" >/dev/null 2>&1; sleep 6
-        local out loss rtt dl ul
+        inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
+        local out loss rtt dl
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
@@ -1617,9 +1648,16 @@ bench_run() {
         # iperf3 serves ONE test at a time; without this settle the upload run
         # lands while the server is still tearing the download down and every
         # upload in the table comes back FAIL.
-        sleep 2
-        ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
-        local ulwhy=""; [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
+        local ul="" ulwhy=""
+        if [[ "${loss:-100}" == 100 ]]; then
+            # nothing came back from the ping either - the tunnel is not carrying
+            # traffic at all, so don't spend another 75s proving it twice.
+            ulwhy=" (tunnel down)"
+        else
+            sleep 2
+            ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8)
+            [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
+        fi
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
         echo "${dl:-FAIL} / up ${ul:-FAIL}${ulwhy}"
         inst_remove "$name" >/dev/null 2>&1
@@ -1632,6 +1670,7 @@ bench_run() {
     done
     # tear down the foreign measurement helpers (iperf + curl file server)
     peer_ssh "$fhost" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
+    peer_ssh_close "$fhost"   # drop the shared SSH connection the run has been reusing
     set -e
 
     ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_UL="${raw_ul:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
@@ -1697,7 +1736,7 @@ cmd_bench_manual() {
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         echo -n "  $t ... "
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" none 8
-        inst_enable "$name" >/dev/null 2>&1; sleep 6
+        inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
         local out loss rtt dl ul
         out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
