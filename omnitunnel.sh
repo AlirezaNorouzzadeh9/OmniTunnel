@@ -171,6 +171,17 @@ type_is_l2() { case "$1" in gretap|gretap-*|vxlan) return 0;; *) return 1;; esac
 # tcp/mux/ws are TCP, so those are unaffected and stay at 51820. hysteria runs its
 # own QUIC/443 masquerade and manages its own port.
 port_base() { case "$1" in udp|fou|fou-*|gue|gretap-fou|vxlan) echo 28820;; *) echo 51820;; esac; }
+# "Fully obfuscated" carriers - nothing on the wire says "tunnel". The AEAD types
+# and hysteria qualify because they are encrypted and shapeless; the fou/gue
+# family qualifies because the GRE tunnel is hidden inside ordinary UDP. Raw
+# proto-47 (gre*, gretap) and vxlan do NOT - they are recognisable as tunnels
+# from the header alone. This drives the benchmark's "stealth pick".
+type_is_stealth() {
+    case "$1" in
+        udp|tcp|mux|ws|hysteria|fou|fou-*|gue|gretap-fou) return 0;;
+        *) return 1;;
+    esac
+}
 # 1-based position of a type in ALL_TYPES, so a menu default can be pinned to a
 # NAME instead of a hardcoded number that silently shifts whenever a transport is
 # added ahead of it.
@@ -1294,7 +1305,7 @@ wizard_add_manual() {
 bench_ensure_iperf() {
     local h="$1" i
     # fast path: already listening
-    peer_ssh "$h" "timeout 12 sh -c 'ss -lntu 2>/dev/null | grep -q :5599'" && return 0
+    peer_ssh "$h" "timeout 12 sh -c 'ss -lntu 2>/dev/null | grep -qw 5599'" && return 0
     # install iperf3 if missing - HARD-BOUNDED so a held dpkg lock or a slow/broken
     # mirror can never hang the benchmark for hours (it used to). Non-interactive,
     # gives up on the lock after 30s and on the whole step after 100s.
@@ -1303,10 +1314,10 @@ bench_ensure_iperf() {
     for i in 1 2 3; do
         peer_ssh "$h" "timeout 15 sh -c '
             command -v iperf3 >/dev/null 2>&1 || exit 3
-            ss -lntu 2>/dev/null | grep -q :5599 && exit 0
+            ss -lntu 2>/dev/null | grep -qw 5599 && exit 0
             systemctl reset-failed tsbench-iperf 2>/dev/null
             systemd-run --unit=tsbench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1 || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 </dev/null &)
-            sleep 1; ss -lntu 2>/dev/null | grep -q :5599'" && return 0
+            sleep 1; ss -lntu 2>/dev/null | grep -qw 5599'" && return 0
         sleep 1
     done
     return 1
@@ -1322,10 +1333,10 @@ bench_ensure_httpfile() {
     peer_ssh "$h" "timeout 90 sh -c '
         command -v python3 >/dev/null 2>&1 || exit 3
         [ -f /tmp/omnibench.bin ] || fallocate -l 200M /tmp/omnibench.bin 2>/dev/null || dd if=/dev/zero of=/tmp/omnibench.bin bs=1M count=200 2>/dev/null
-        ss -lntu 2>/dev/null | grep -q :5598 && exit 0
+        ss -lntu 2>/dev/null | grep -qw 5598 && exit 0
         systemctl reset-failed tsbench-http 2>/dev/null
         systemd-run --unit=tsbench-http --collect python3 -m http.server 5598 --directory /tmp >/dev/null 2>&1 || (setsid python3 -m http.server 5598 --directory /tmp >/dev/null 2>&1 </dev/null &)
-        sleep 1; ss -lntu 2>/dev/null | grep -q :5598'" >/dev/null 2>&1
+        sleep 1; ss -lntu 2>/dev/null | grep -qw 5598'" >/dev/null 2>&1
 }
 # measure download speed of a URL and print it iperf-style ("NNN Mbits/sec"); empty on failure
 bench_curl_mbps() {
@@ -1525,7 +1536,12 @@ bench_run() {
 # brought up once from a single pasted token; this side measures all four
 # tunnels, prints the table, and lets you keep one. Fixed bench subnets
 # (10.201.100-103) / ports (51900-51903) so both sides match deterministically.
-_bench_key_for() { case "$1" in udp) echo "$B_KUDP";; mux) echo "$B_KMUX";; tcp) echo "$B_KTCP";; *) echo "";; esac; }
+# ws is a keyed AEAD transport like udp/tcp/mux. It used to fall through to ""
+# here, which built `-k  -s ...`: getopt then ate `-s` as the key, the 64-hex
+# check rejected it and the server flag was lost, so ws scored FAIL in every
+# manual benchmark. It shares mux's key rather than taking a fourth token field,
+# because the bench token is a fixed 6-field format both sides already parse.
+_bench_key_for() { case "$1" in udp) echo "$B_KUDP";; mux|ws) echo "$B_KMUX";; tcp) echo "$B_KTCP";; *) echo "";; esac; }
 cmd_bench_manual() {
     need_root; ensure_binary
     local fhost="$1" mylip="${2:-$(default_local_ip)}"
@@ -1822,13 +1838,13 @@ bench_table() {
         IFS='|' read -r t dl ul ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
         if _gt "$v" "$max"; then max="$v"; fi
-        case "$t" in udp|tcp|mux|ws|hysteria|fou) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
+        if type_is_stealth "$t" && _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
     echo
     printf '  %braw path (plain TCP, policed)%b   down %b%s%b / up %b%s%b   rtt %b%s ms%b\n\n' \
         "$C_GREY" "$C_RESET" "$C_WHITE" "${RAW_DL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_UL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_PING:-n/a}" "$C_RESET"
-    printf '    %b%-9s %-14s %-9s %-7s %-6s %s%b\n' "$C_GREY" "TYPE" "DOWNLOAD" "UPLOAD" "" "LOSS" "PING" "$C_RESET"
+    printf '    %b%-11s %-14s %-9s %-7s %-6s %s%b\n' "$C_GREY" "TYPE" "DOWNLOAD" "UPLOAD" "" "LOSS" "PING" "$C_RESET"
     local first=1 n bar bc lcol lsc ucol mark note dnum unum
     for line in "${sorted[@]}"; do
         v="${line%%|*}"; r="${line#*|}"; IFS='|' read -r t dl ul ls pg <<< "$r"
@@ -1842,7 +1858,7 @@ bench_table() {
         dnum="$dl"; [[ "$dl" == *bits/sec* ]] && dnum="${dl%% *}$(printf '%s' "${dl#* }" | cut -c1)"
         unum="$ul"; [[ "$ul" == *bits/sec* ]] && unum="${ul%% *}$(printf '%s' "${ul#* }" | cut -c1)"
         ucol="$lcol"; [[ "$ul" == FAIL || "$ul" == n/a ]] && ucol="$C_BYEL"
-        printf '  %b%s%b %b%-9s%b %b%s%b %b%-7s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
+        printf '  %b%s%b %b%-11s%b %b%s%b %b%-7s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
             "$C_BGRN" "$mark" "$C_RESET" "$lcol" "$t" "$C_RESET" \
             "$bc" "$bar" "$C_RESET" "$lcol" "$dnum" "$C_RESET" \
             "$ucol" "$unum" "$C_RESET" \
