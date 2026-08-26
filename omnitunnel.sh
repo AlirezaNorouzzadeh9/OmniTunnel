@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.10.2"
+VERSION="2.11.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -118,7 +118,7 @@ ensure_chisel() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre gre-seq gre-csum gre-tos gretap icmp udp mux ws hysteria tcp fou fou-seq gue gretap-fou vxlan geneve reverse-mux"
+ALL_TYPES="gre gre-seq gre-csum gre-tos gretap icmp udp mux ws hysteria tcp fou fou-seq gue gretap-fou vxlan geneve wg reverse-mux"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
@@ -138,6 +138,7 @@ type_desc() {
         fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
         vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
         geneve)   echo "GENEVE L2-over-UDP  (kernel; the other datacenter overlay - different header than VXLAN)";;
+        wg)       echo "WireGuard  (kernel; ChaCha20 encrypted, on a port clear of the blocked WG range)";;
         reverse-mux) echo "ICMP-reply + single-flow MUX  (Iran->foreign relay: beats policed multi-flow UPLOAD)";;
         *) echo "";;
     esac
@@ -158,20 +159,23 @@ type_is_revmux() { [[ "$1" == reverse-mux ]]; }
 # native kernel tunnels - no compiled core binary involved
 type_is_kernel() {
     case "$1" in
-        gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan|geneve) return 0;;
+        gre|gre-*|gretap|gretap-*|fou|fou-*|gue|vxlan|geneve|wg) return 0;;
         *) return 1;;
     esac
 }
 # kernel carriers whose device is Ethernet (L2), so the tunnel address is a /24 on
 # a broadcast link instead of a point-to-point `peer` address.
 type_is_l2() { case "$1" in gretap|gretap-*|vxlan|geneve) return 0;; *) return 1;; esac; }
+# WireGuard: kernel device, but configured with `wg set` and a private key rather
+# than a single `ip link add`, so it does not go through kernel_up_cmd.
+type_is_wg() { [[ "$1" == wg ]]; }
 # Starting port for auto-allocation. udp/fou/vxlan carry REAL UDP, so keep them
 # well clear of the 51820-51899 WireGuard range that some ISPs (seen on IR mobile)
 # block wholesale - a UDP tunnel landing on 51821 there is silently dropped (this
 # bit the plain `udp` transport too). gre's "port" is only a GRE key, and
 # tcp/mux/ws are TCP, so those are unaffected and stay at 51820. hysteria runs its
 # own QUIC/443 masquerade and manages its own port.
-port_base() { case "$1" in udp|fou|fou-*|gue|gretap-fou|vxlan|geneve) echo 28820;; *) echo 51820;; esac; }
+port_base() { case "$1" in udp|fou|fou-*|gue|gretap-fou|vxlan|geneve|wg) echo 28820;; *) echo 51820;; esac; }
 # "Fully obfuscated" carriers - nothing on the wire says "tunnel". The AEAD types
 # and hysteria qualify because they are encrypted and shapeless; the fou/gue
 # family qualifies because the GRE tunnel is hidden inside ordinary UDP. Raw
@@ -234,7 +238,84 @@ ICMP_MODE=$imode
 EOF
 }
 
+# ----------------------------------------------------------- wireguard --------
+# WireGuard needs an asymmetric keypair per side, which does not fit this
+# project's "one shared 64-hex KEY" model. Rather than grow the token format and
+# the provisioning path to carry four more fields, BOTH keypairs are derived
+# deterministically from the KEY that already travels:
+#
+#     private_client = sha256(KEY || "client")   (32 bytes, base64)
+#     private_server = sha256(KEY || "server")
+#     preshared      = sha256(KEY || "psk")
+#
+# Each end computes its own private key from its ROLE and the peer's PUBLIC key
+# with `wg pubkey`, so nothing extra is exchanged, `server-token` and
+# `_peercreate` are untouched, and a restart or a re-provision reproduces exactly
+# the same keys. WireGuard clamps the scalar itself, so any 32 bytes is valid.
+#
+# The preshared key is a second symmetric layer on top of the handshake - it is
+# what gives WireGuard its post-quantum resistance - and costs nothing here since
+# it comes from the same secret.
+#
+# Caveat worth knowing: the WireGuard handshake has a recognisable shape on the
+# wire. This is NOT a stealth transport, and it is deliberately left out of the
+# obfuscated set. Its port comes from the 28820 base rather than 51820 so it at
+# least avoids the WireGuard port range some IR ISPs block outright.
+wg_derive() {
+    if command -v openssl >/dev/null 2>&1; then
+        printf '%s' "$1$2" | openssl dgst -sha256 -binary | base64 | tr -d '\n'
+    else
+        printf '%s' "$1$2" | sha256sum | cut -c1-64 | xxd -r -p | base64 | tr -d '\n'
+    fi
+}
+ensure_wireguard() {
+    modprobe wireguard 2>/dev/null || true
+    if ! command -v wg >/dev/null 2>&1; then
+        info "  installing wireguard-tools ..."
+        if command -v apt-get >/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null; then
+            yum install -y -q wireguard-tools >/dev/null 2>&1 || true
+        fi
+    fi
+    command -v wg >/dev/null 2>&1 || die "wireguard-tools not available - install the 'wireguard-tools' package"
+    ip link add __wgprobe type wireguard 2>/dev/null \
+        || die "this kernel has no WireGuard support (module 'wireguard' could not be loaded)"
+    ip link del __wgprobe 2>/dev/null || true
+}
+# Bring up / tear down a wireguard instance. Runs as the unit's ExecStart rather
+# than a `/bin/sh -c` one-liner precisely so the private key never lands in the
+# unit file or in the process list - it goes to a 0600 file that is deleted the
+# moment `wg set` has read it.
+cmd_wgup() {
+    need_root; load_inst "$1"; ensure_wireguard
+    [[ -n "${KEY:-}" ]] || die "instance '$1' has no key; wireguard needs one"
+    local cpriv spriv psk mypriv peerpub d
+    cpriv="$(wg_derive "$KEY" client)"; spriv="$(wg_derive "$KEY" server)"; psk="$(wg_derive "$KEY" psk)"
+    if [[ "$ROLE" == server ]]; then
+        mypriv="$spriv"; peerpub="$(printf '%s' "$cpriv" | wg pubkey)"
+    else
+        mypriv="$cpriv"; peerpub="$(printf '%s' "$spriv" | wg pubkey)"
+    fi
+    ip link del "$DEV" 2>/dev/null || true
+    ip link add "$DEV" type wireguard || die "could not create $DEV"
+    d="$(inst_path "$1")"; umask 077
+    printf '%s' "$mypriv" > "$d/wg.priv"; printf '%s' "$psk" > "$d/wg.psk"
+    chmod 600 "$d/wg.priv" "$d/wg.psk"
+    # persistent-keepalive keeps a NAT/stateful-firewall mapping alive on the
+    # carrier path; 15s is frequent enough for that without being a beacon.
+    wg set "$DEV" listen-port "$PORT" private-key "$d/wg.priv" \
+        peer "$peerpub" preshared-key "$d/wg.psk" \
+        allowed-ips "$PEER_ADDR/32" endpoint "$PEER_IP:$PORT" persistent-keepalive 15 \
+        || { rm -f "$d/wg.priv" "$d/wg.psk"; ip link del "$DEV" 2>/dev/null; die "wg set failed for $1"; }
+    rm -f "$d/wg.priv" "$d/wg.psk"
+    ip addr add "$TUN_ADDR" peer "$PEER_ADDR" dev "$DEV" 2>/dev/null || true
+    ip link set "$DEV" up mtu "$MTU"
+}
+cmd_wgdown() { need_root; load_inst "$1"; ip link del "$DEV" 2>/dev/null || true; }
+
 # ------------------------------------------------- kernel carrier commands ----
+
 # Native kernel tunnels (the GRE family, fou/gue, vxlan) are brought up with plain
 # `ip` commands - no core binary. PORT does double duty as the disambiguator so
 # several tunnels can share one endpoint pair without colliding:
@@ -579,6 +660,7 @@ apply_tuning() {
 write_service() {
     load_inst "$1"
     if type_is_hysteria "$TYPE"; then ensure_hysteria
+    elif type_is_wg "$TYPE"; then ensure_wireguard
     elif ! type_is_kernel "$TYPE"; then ensure_binary; fi
     local unit="/etc/systemd/system/$(svc_name "$1")"
     if type_is_hysteria "$TYPE"; then
@@ -596,6 +678,27 @@ ExecStart=$HYSTERIA_BIN $mode -c $(inst_path "$1")/hy.yaml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    elif type_is_wg "$TYPE"; then
+        # WireGuard is a kernel device too, but bringing it up needs a private
+        # key. Calling back into this script keeps that key out of the unit file
+        # and out of the process list - see cmd_wgup.
+        cat > "$unit" <<EOF
+[Unit]
+Description=OmniTunnel wireguard instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SCRIPT_PATH _wgup $1
+ExecStartPost=$SCRIPT_PATH _postup $1
+ExecStop=-$SCRIPT_PATH _wgdown $1
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
@@ -1744,7 +1847,7 @@ bench_run() {
 # check rejected it and the server flag was lost, so ws scored FAIL in every
 # manual benchmark. It shares mux's key rather than taking a fourth token field,
 # because the bench token is a fixed 6-field format both sides already parse.
-_bench_key_for() { case "$1" in udp) echo "$B_KUDP";; mux|ws) echo "$B_KMUX";; tcp) echo "$B_KTCP";; *) echo "";; esac; }
+_bench_key_for() { case "$1" in udp|wg) echo "$B_KUDP";; mux|ws) echo "$B_KMUX";; tcp) echo "$B_KTCP";; *) echo "";; esac; }
 cmd_bench_manual() {
     need_root; ensure_binary
     local fhost="$1" mylip="${2:-$(default_local_ip)}"
@@ -2188,6 +2291,8 @@ case "${1:-menu}" in
     mux-token)        need_root; cmd_mux_token "${2:?token}";;
     mux-off)          need_root; cmd_mux_off "${2:?instance}";;
     _postup)          cmd_postup "${2:?}";;
+    _wgup)            need_root; cmd_wgup "${2:?instance}";;
+    _wgdown)          need_root; cmd_wgdown "${2:?instance}";;
     _peercreate)      shift; cmd_peercreate "$@";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
     update|upgrade)   need_root; cmd_update;;
