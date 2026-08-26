@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.5"
+VERSION="2.9.6"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1037,12 +1037,21 @@ peer_conf() { echo "$PEER_DIR/$1.conf"; }
 # 'source'd) - so a password with shell-special characters ($ # & ; ` ( ) space
 # quotes ...) is preserved exactly instead of being mangled (or worse, executed).
 # save_peer <host> <user> <pass> [socks5_proxy] [ssh_port]
+#
+# MERGES with whatever is already stored: an empty argument keeps the existing
+# value instead of erasing it. Without this, setting just the port (or just the
+# proxy) would silently wipe the saved password and the next provisioning run
+# would fail to authenticate for no visible reason.
 save_peer() {
     mkdir -p "$PEER_DIR"; chmod 700 "$PEER_DIR"
-    { printf 'PEER_USER=%s\n' "$(printf '%s' "$2" | base64 | tr -d '\n')"
-      printf 'PEER_PASS=%s\n' "$(printf '%s' "$3" | base64 | tr -d '\n')"
-      [[ -n "${4:-}" ]] && printf 'PEER_PROXY=%s\n' "$(printf '%s' "$4" | base64 | tr -d '\n')"
-      [[ -n "${5:-}" ]] && printf 'PEER_PORT=%s\n' "$(printf '%s' "$5" | base64 | tr -d '\n')"
+    local o_user o_pass o_proxy o_port
+    _peer_creds "$1"
+    o_user="$PEER_USER"; o_pass="$PEER_PASS"; o_proxy="$PEER_PROXY"; o_port="$PEER_PORT"
+    local u="${2:-$o_user}" p="${3:-$o_pass}" x="${4:-$o_proxy}" t="${5:-$o_port}"
+    { printf 'PEER_USER=%s\n' "$(printf '%s' "$u" | base64 | tr -d '\n')"
+      printf 'PEER_PASS=%s\n' "$(printf '%s' "$p" | base64 | tr -d '\n')"
+      [[ -n "$x" ]] && printf 'PEER_PROXY=%s\n' "$(printf '%s' "$x" | base64 | tr -d '\n')"
+      [[ -n "$t" ]] && printf 'PEER_PORT=%s\n' "$(printf '%s' "$t" | base64 | tr -d '\n')"
     } > "$(peer_conf "$1")"
     chmod 600 "$(peer_conf "$1")"
 }
