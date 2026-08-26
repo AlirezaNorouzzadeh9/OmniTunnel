@@ -2,15 +2,15 @@
 # OmniTunnel installer / updater - fetches the repo, drops the right prebuilt
 # binaries for this CPU, and installs the manager. No compiler required.
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh) && omnitunnel
+#   bash <(curl -fsSL https://raw.githubusercontent.com/AlirezaNorouzzadeh9/OmniTunnel/main/install.sh) && omnitunnel
 #
 # Re-running it is also the update path: it detects an existing install, refreshes
 # the manager + binaries, and - if the version actually changed - restarts the
 # running tunnels so they pick up the new core. Nothing is torn down when the
 # version is unchanged.
 set -euo pipefail
-REPO="https://github.com/Free-Guy-IR/OmniTunnel"
-RAW="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
+REPO="https://github.com/AlirezaNorouzzadeh9/OmniTunnel"
+RAW="https://raw.githubusercontent.com/AlirezaNorouzzadeh9/OmniTunnel/main"
 DEST="/opt/omnitunnel"
 BINLINK="/usr/local/bin/omnitunnel"
 

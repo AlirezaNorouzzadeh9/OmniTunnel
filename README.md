@@ -88,7 +88,7 @@ No compiler needed — the right static binary for your CPU (**amd64** or
 ### Run this one line on your **Iran** server:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh) && omnitunnel
+bash <(curl -fsSL https://raw.githubusercontent.com/AlirezaNorouzzadeh9/OmniTunnel/main/install.sh) && omnitunnel
 ```
 
 That's it. You run it **only on the Iran side**. When you add a tunnel (or run
@@ -104,7 +104,7 @@ by hand.
 From a checkout instead of the one-liner:
 
 ```bash
-git clone https://github.com/Free-Guy-IR/OmniTunnel
+git clone https://github.com/AlirezaNorouzzadeh9/OmniTunnel
 cd OmniTunnel && sudo ./install.sh && omnitunnel
 ```
 
@@ -177,7 +177,7 @@ It brings up the near (Iran) side and prints two lines to paste on the foreign
 box (which abroad can reach GitHub fine):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/AlirezaNorouzzadeh9/OmniTunnel/main/install.sh)
 omnitunnel server-token <token>
 ```
 
@@ -255,7 +255,7 @@ omnitun udp  ...     omnitun tcp  ...     omnitun icmp ...
 version-aware:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh) && omnitunnel
+bash <(curl -fsSL https://raw.githubusercontent.com/AlirezaNorouzzadeh9/OmniTunnel/main/install.sh) && omnitunnel
 ```
 
 It detects the installed version, refreshes the manager and the core binaries,

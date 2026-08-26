@@ -44,7 +44,7 @@ CHISEL_BIN="/usr/local/bin/chisel"
 CHISEL_VER="1.10.1"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
-RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
+RAW_BASE="https://raw.githubusercontent.com/AlirezaNorouzzadeh9/OmniTunnel/main"
 
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
 C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
@@ -1787,7 +1787,7 @@ EOF
     printf '  %bMulti-protocol obfuscated tunnel suite%b\n\n' "$C_WHITE" "$C_RESET"
     kv "Script Version:" "$VERSION"
     kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
-    kv "Source:" "github.com/Free-Guy-IR/OmniTunnel"
+    kv "Source:" "github.com/AlirezaNorouzzadeh9/OmniTunnel"
     rule_amber
     kv "IP Address:" "${myip:-unknown}"
     kv "Architecture:" "$(arch_tag)"
