@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.8"
+VERSION="2.9.9"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1526,15 +1526,28 @@ bench_run() {
     printf "  %bhysteria Brutal-CC target auto-scaled to %s mbps%b\n" "$C_GREY" "$hy_target" "$C_RESET"
 
     echo; printf "%b\n" "${C_BOLD}Benchmarking each tunnel (a few minutes)...${C_RESET}"
-    local rows=() base; base=$(next_subnet_idx); local i=0 t
+    # Ask the FOREIGN what it already runs before allocating anything. Without
+    # this the bench numbered subnets from 0 upward against the local box only.
+    # On a foreign that serves several Iran boxes - a documented topology - the
+    # first test tunnels then land on the same 10.201.N and the same GRE key as
+    # live production tunnels: the far side ends up with duplicate addresses, the
+    # test reads 100% loss, and the production tunnel it collided with is
+    # disturbed. Observed for real: three GRE variants "failed" purely because
+    # they had been given the slots of three live tunnels, and the fourth passed
+    # only because the instance on its slot happened to be stopped.
+    local fsub fport
+    fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\.201\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
+    [[ -n "${fsub// /}" ]] && printf '  %bfar side already uses subnets:%b %s%b\n' "$C_GREY" "$C_RESET" "$fsub" "$C_RESET"
+    local rows=() used_sub="$fsub" used_port="$fport"; local i=0 t
     # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
     # that times out, a far-side bring-up hiccup) must NOT abort the whole run
     # under 'set -e'. Relax it for the loop; each type just records FAIL instead.
     set +e
     for t in $ALL_TYPES; do
-        local name="bench-$t" sub=$((base+i)); i=$((i+1))
+        local name="bench-$t" sub; sub=$(alloc_subnet "$used_sub"); used_sub+=" $sub"; i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
-        port=$(next_port $(( $(port_base "$t") + sub ))); key=$(gen_key)
+        port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$used_port"); used_port+=" $port"; key=$(gen_key)
         type_uses_key "$t" || key=""
         echo -n "  $t ... "
         # hysteria has no tun/ping: forward the iperf port through it and measure
