@@ -248,6 +248,8 @@ omnitunnel status  <instance>
 omnitunnel remove  <instance>        # removes ONLY that instance (both-side safe)
 omnitunnel pf-add  <instance> <tcp|udp|both> <port>
 omnitunnel bench
+# only a few transports (a full 18-transport run takes ~20 min on a 40 ms link):
+OMNITUN_BENCH_TYPES="gre icmp udp tcp mux ws hysteria fou" omnitunnel bench
 omnitunnel update                    # pull the latest from GitHub (see below)
 omnitunnel uninstall                 # remove every tunnel + all files, incl. itself
 ```

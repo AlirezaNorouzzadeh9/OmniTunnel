@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.10.0"
+VERSION="2.10.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1570,12 +1570,26 @@ bench_run() {
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\.201\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
     fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
     [[ -n "${fsub// /}" ]] && printf '  %bfar side already uses subnets:%b %s%b\n' "$C_GREY" "$C_RESET" "$fsub" "$C_RESET"
+    # Measuring all of ALL_TYPES takes ~21 min on a 40 ms link, and most of that
+    # is per-tunnel setup and teardown that scales linearly with the list. When
+    # you only want a quick read, name the transports to try:
+    #     OMNITUN_BENCH_TYPES="gre icmp udp tcp mux ws hysteria fou" omnitunnel bench
+    # Unknown names are dropped with a warning rather than silently ignored.
+    local bench_types="$ALL_TYPES"
+    if [[ -n "${OMNITUN_BENCH_TYPES:-}" ]]; then
+        local want="" bt
+        for bt in $OMNITUN_BENCH_TYPES; do
+            case " $ALL_TYPES " in *" $bt "*) want+="$bt ";; *) warn "unknown transport '$bt' - skipping";; esac
+        done
+        [[ -n "$want" ]] && bench_types="$want" || warn "no valid transports in OMNITUN_BENCH_TYPES - benchmarking all"
+        printf '  %bbenchmarking %s of %s transports%b\n' "$C_GREY" "$(echo $bench_types | wc -w)" "$(echo $ALL_TYPES | wc -w)" "$C_RESET"
+    fi
     local rows=() used_sub="$fsub" used_port="$fport"; local i=0 t
     # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
     # that times out, a far-side bring-up hiccup) must NOT abort the whole run
     # under 'set -e'. Relax it for the loop; each type just records FAIL instead.
     set +e
-    for t in $ALL_TYPES; do
+    for t in $bench_types; do
         local name="bench-$t" sub; sub=$(alloc_subnet "$used_sub"); used_sub+=" $sub"; i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
         port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$used_port"); used_port+=" $port"; key=$(gen_key)
@@ -1615,7 +1629,7 @@ bench_run() {
             create_inst "$name" reverse-mux client "$mylip" "$fhost" "$port" "" "$ta" "$pa" none "$nc" reply
             inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
             local rout rloss rrtt
-            rout=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
+            rout=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
             rrtt=$(echo "$rout" | awk -F'/' '/rtt|round-trip/{print $5}')
             rloss=$(echo "$rout" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
             echo "$bport:127.0.0.1:5599" > "$(mux_conf "$name")"
@@ -1635,7 +1649,7 @@ bench_run() {
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
         inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
         local out loss rtt dl
-        out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
+        out=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
         dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
@@ -1664,7 +1678,7 @@ bench_run() {
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
     done
     # belt-and-braces: make sure no bench-* survived on either side
-    for t in $ALL_TYPES; do
+    for t in $bench_types; do
         inst_exists "bench-$t" && inst_remove "bench-$t" >/dev/null 2>&1 || true
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove 'bench-$t'" >/dev/null 2>&1 || true
     done
@@ -1738,7 +1752,7 @@ cmd_bench_manual() {
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" none 8
         inst_enable "$name" >/dev/null 2>&1; bench_wait_ready "$pa" 20 || true
         local out loss rtt dl ul
-        out=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
+        out=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
         loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
         dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t 12 -O 4 -P 8 -R)
