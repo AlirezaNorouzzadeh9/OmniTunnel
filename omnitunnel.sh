@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.11.0"
+VERSION="2.11.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1176,6 +1176,23 @@ alloc_subnet() {
     done
     echo 0
 }
+# An explicit tunnel port, when the operator wants one. The script this project
+# borrows from shipped fourteen separate "WireGuard" transports that differed in
+# nothing but their port number - 443, 4500, 8443, 47000... - because it had no
+# way to say "the same transport, on that port". Allocation here is automatic, so
+# one override covers all of it, and it works for every transport rather than
+# just WireGuard: udp on 53, fou on 443, wg on 4500.
+#
+# For the GRE family PORT doubles as the GRE key and for vxlan/geneve as the VNI,
+# so overriding it changes those too - which is the intent.
+# Returns the chosen port, or the auto-allocated one when unset.
+port_override() {
+    local auto="$1" want="${OMNITUN_PORT:-}"
+    [[ -n "$want" ]] || { echo "$auto"; return 0; }
+    [[ "$want" =~ ^[0-9]+$ && "$want" -ge 1 && "$want" -le 65535 ]] \
+        || die "OMNITUN_PORT must be 1-65535 (got $want)"
+    echo "$want"
+}
 alloc_port() {
     local cand="${1:-51820}" avoid=" ${2:-} " localused
     localused=" $(grep -hoE 'PORT=[0-9]+' "$INST_DIR"/*/instance.conf 2>/dev/null | grep -oE '[0-9]+' | tr '\n' ' ') "
@@ -1355,7 +1372,7 @@ cmd_add_auto() {
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$t" || key=""
+    port=$(port_override "$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport")"); key=$(gen_key); type_uses_key "$t" || key=""
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
     for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
     [[ "$t" == icmp ]] || { imode=""; pmode=""; }
@@ -1454,8 +1471,14 @@ wizard_add() {
     fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - pick a different name"; return;; esac
+    read -erp "Tunnel port [auto - pick one only to dodge a blocked range, e.g. 443]: " tp
+    if [[ -n "$tp" ]]; then
+        if [[ "$tp" =~ ^[0-9]+$ && "$tp" -ge 1 && "$tp" -le 65535 ]]; then export OMNITUN_PORT="$tp"
+        else warn "tunnel port must be 1-65535 - ignoring '$tp'"; fi
+    fi
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key)
+    port=$(port_override "$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport")"); key=$(gen_key)
+    unset OMNITUN_PORT
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
