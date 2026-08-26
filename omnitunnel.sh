@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.11.2"
+VERSION="2.11.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1763,7 +1763,10 @@ bench_run() {
     for t in $bench_types; do
         local name="bench-$t" sub; sub=$(alloc_subnet "$used_sub"); used_sub+=" $sub"; i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
-        port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$used_port"); used_port+=" $port"; key=$(gen_key)
+        # OMNITUN_PORT pins the carrier port for the whole run, which is how you
+        # answer "does this transport get through on 443?" without inventing a
+        # separate transport per port the way the script this came from did.
+        port=$(port_override "$(alloc_port "$(( $(port_base "$t") + sub ))" "$used_port")"); used_port+=" $port"; key=$(gen_key)
         type_uses_key "$t" || key=""
         echo -n "  $t ... "
         # hysteria has no tun/ping: forward the iperf port through it and measure
