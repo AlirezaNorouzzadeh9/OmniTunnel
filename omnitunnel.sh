@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.11.1"
+VERSION="2.11.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1540,6 +1540,27 @@ wizard_add_manual() {
 # to mean something:   OMNITUN_BENCH_SECS=20 omnitunnel bench
 BENCH_SECS="${OMNITUN_BENCH_SECS:-8}"
 BENCH_OMIT="${OMNITUN_BENCH_OMIT:-2}"
+# A tunnel cannot beat the path it rides on. When a figure comes back well above
+# the raw rate, something other than the tunnel was measured - the usual cause is
+# the loopback relay ports (5598/5599) already being held by a stray local
+# listener, so iperf3 talks to that instead of through the tunnel and reports
+# loopback speed. Seen for real: 8.13 Gbit/s "upload" on a 162 Mbit path, which
+# also sorted straight to the top of the table.
+#
+# 1.5x leaves room for genuine measurement spread and for a raw figure taken a
+# few minutes earlier on a link that has since improved; anything past that is
+# not a slow tunnel, it is a wrong number, and reporting nothing beats reporting
+# a fake winner. Skipped entirely when the raw path could not be measured.
+bench_sane() {
+    local v="$1" raw="$2"
+    [[ -z "$v" ]] && { printf ""; return 1; }
+    local rm_; rm_="$(_mbit "$raw")"
+    awk -v r="$rm_" 'BEGIN{ exit !(r > 0.05) }' || { printf "%s" "$v"; return 0; }
+    if awk -v a="$(_mbit "$v")" -v r="$rm_" 'BEGIN{ exit !(a > r*1.5) }'; then
+        printf ""; return 1
+    fi
+    printf "%s" "$v"; return 0
+}
 _BENCH_WHY_F="${TMPDIR:-/tmp}/omnitunnel-bench-why.$$"
 _bench_why() { cat "$_BENCH_WHY_F" 2>/dev/null; }
 _iperf_rx() {
@@ -1764,6 +1785,8 @@ bench_run() {
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
             hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
             hul=$(_iperf_rx 75 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8)
+            hdl=$(bench_sane "$hdl" "$raw_dl") || hdl=""
+            hul=$(bench_sane "$hul" "$raw_ul") || hul=""
             rows+=("$t|${hdl:-FAIL}|${hul:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL} / up ${hul:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
@@ -1789,6 +1812,8 @@ bench_run() {
             local rdl rul
             rdl=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8 -R)
             rul=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
+            rdl=$(bench_sane "$rdl" "$raw_dl") || rdl=""
+            rul=$(bench_sane "$rul" "$raw_ul") || rul=""
             rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
             echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
             inst_remove "$name" >/dev/null 2>&1
@@ -1822,6 +1847,8 @@ bench_run() {
             ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
             [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
         fi
+        dl=$(bench_sane "$dl" "$raw_dl") || dl=""
+        ul=$(bench_sane "$ul" "$raw_ul") || ul=""
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
         echo "${dl:-FAIL} / up ${ul:-FAIL}${ulwhy}"
         inst_remove "$name" >/dev/null 2>&1
