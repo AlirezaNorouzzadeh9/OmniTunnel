@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.12.1"
+VERSION="2.12.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1760,6 +1760,34 @@ bench_curl_mbps() {
     [[ -n "$bps" ]] || return 1
     awk -v b="$bps" 'BEGIN{ m=b*8/1000000; if(m<0.05) exit 1; printf "%.3g Mbits/sec", m }'
 }
+# An interrupted benchmark used to leave every tunnel it had already created
+# standing on BOTH sides: Ctrl-C, a dropped SSH session or a closed terminal
+# skipped the cleanup entirely, because there was no trap. Found in the wild - a
+# foreign box was still carrying bench-fou, bench-vxlan and bench-reverse-mux
+# four days after the run that made them, three of them up, holding subnets that
+# every later run then had to allocate around.
+#
+# Sweeps ALL_TYPES rather than just the types this run measured, so debris from
+# an earlier run with a different OMNITUN_BENCH_TYPES gets collected too.
+BENCH_FHOST=""
+_bench_cleanup_all() {
+    local h="$1" t
+    [[ -n "$h" ]] || return 0
+    for t in $ALL_TYPES; do
+        inst_exists "bench-$t" && inst_remove "bench-$t" >/dev/null 2>&1 || true
+        peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove 'bench-$t'" >/dev/null 2>&1 || true
+    done
+}
+_bench_trap() {
+    trap - INT TERM
+    echo
+    warn "interrupted - tearing down the test tunnels on both sides, please wait..."
+    _bench_cleanup_all "$BENCH_FHOST"
+    peer_ssh "$BENCH_FHOST" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
+    peer_ssh_close "$BENCH_FHOST" >/dev/null 2>&1 || true
+    ok "test tunnels removed."
+    exit 130
+}
 bench_run() {
     need_root; ensure_binary
     local fhost fu fp fpt mylip x
@@ -1847,6 +1875,22 @@ bench_run() {
         [[ -n "$want" ]] && bench_types="$want" || warn "no valid transports in OMNITUN_BENCH_TYPES - benchmarking all"
         printf '  %bbenchmarking %s of %s transports%b\n' "$C_GREY" "$(echo $bench_types | wc -w)" "$(echo $ALL_TYPES | wc -w)" "$C_RESET"
     fi
+    BENCH_FHOST="$fhost"; trap _bench_trap INT TERM
+    # Sweep BEFORE measuring, not only after. The trap above catches a clean
+    # Ctrl-C, but it cannot be relied on: bash resets traps to their default
+    # inside the $(...) subshells this loop spends most of its time in, so a
+    # signal that lands there kills the subshell without ever reaching the
+    # handler. A run that dies any other way - SIGKILL, a dropped SSH session, a
+    # closed terminal, a reboot - leaves debris too.
+    #
+    # Sweeping at the start is unconditional and needs no signal to work. Seen in
+    # the wild: a foreign box carrying bench-fou, bench-vxlan and bench-reverse-mux
+    # four days after the run that created them, three still up, holding subnets
+    # every later run then had to allocate around.
+    if ls -1 "$INST_DIR" 2>/dev/null | grep -q '^bench-'; then
+        info "clearing test tunnels left by an earlier run..."
+    fi
+    _bench_cleanup_all "$fhost"
     local rows=() used_sub="$fsub" used_port="$fport"; local i=0 t
     # Throwaway instances: skip boot symlinks and the cosmetic status settle.
     local _saved_noboot="${OMNITUN_NO_BOOT:-}"; export OMNITUN_NO_BOOT=1
@@ -1959,6 +2003,7 @@ bench_run() {
     # tear down the foreign measurement helpers (iperf + curl file server)
     peer_ssh "$fhost" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
     peer_ssh_close "$fhost"   # drop the shared SSH connection the run has been reusing
+    trap - INT TERM
     set -e
 
     ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_UL="${raw_ul:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
