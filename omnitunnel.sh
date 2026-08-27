@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.12.0"
+VERSION="2.12.1"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1965,9 +1965,17 @@ bench_run() {
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
     rule_green
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
-    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-11s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
-    echo "  0) keep none"
-    read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
+    # The table above already carries each row's ID, so re-listing all of
+    # ALL_TYPES here just scrolled the results off the screen. Anything that was
+    # benchmarked can be picked straight from the table; the full list is still
+    # one keystroke away for a type this run skipped.
+    echo "     pick an ID from the table above, 0 = keep none, l = list every type"
+    read -erp "Choice: " ch || true
+    if [[ "$ch" == l || "$ch" == L ]]; then
+        local ci=1 t2; for t2 in $ALL_TYPES; do printf "  %2d) %-11s %s\n" "$ci" "$t2" "$(type_desc "$t2")"; ci=$((ci+1)); done
+        read -erp "Choice: " ch || true
+    fi
+    [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
     read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
     local nc=16 shape=none
@@ -2041,9 +2049,17 @@ cmd_bench_manual() {
     echo
     rule_green
     printf '  %bKeep one as a permanent instance?%b %b(sets up its own fresh token)%b ' "$C_BGRN" "$C_RESET" "$C_GREY" "$C_RESET"
-    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-11s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
-    echo "  0) keep none"
-    read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
+    # The table above already carries each row's ID, so re-listing all of
+    # ALL_TYPES here just scrolled the results off the screen. Anything that was
+    # benchmarked can be picked straight from the table; the full list is still
+    # one keystroke away for a type this run skipped.
+    echo "     pick an ID from the table above, 0 = keep none, l = list every type"
+    read -erp "Choice: " ch || true
+    if [[ "$ch" == l || "$ch" == L ]]; then
+        local ci=1 t2; for t2 in $ALL_TYPES; do printf "  %2d) %-11s %s\n" "$ci" "$t2" "$(type_desc "$t2")"; ci=$((ci+1)); done
+        read -erp "Choice: " ch || true
+    fi
+    [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
     local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
     read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"
     local nc=16 shape=none
@@ -2297,10 +2313,14 @@ bench_table() {
     echo
     printf '  %braw path (plain TCP, policed)%b   down %b%s%b / up %b%s%b   rtt %b%s ms%b\n\n' \
         "$C_GREY" "$C_RESET" "$C_WHITE" "${RAW_DL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_UL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_PING:-n/a}" "$C_RESET"
-    printf '    %b%-11s %-14s %-9s %-7s %-6s %s%b\n' "$C_GREY" "TYPE" "DOWNLOAD" "UPLOAD" "" "LOSS" "PING" "$C_RESET"
+    printf '    %b%-2s %-11s %-14s %-9s %-7s %-6s %s%b\n' "$C_GREY" "ID" "TYPE" "DOWNLOAD" "UPLOAD" "" "LOSS" "PING" "$C_RESET"
     local first=1 n bar bc lcol lsc ucol mark note dnum unum
     for line in "${sorted[@]}"; do
         v="${line%%|*}"; r="${line#*|}"; IFS='|' read -r t dl ul ls pg <<< "$r"
+        # The number the keep prompt expects. The table is sorted by speed while
+        # that prompt numbers by ALL_TYPES order, so without this you read the
+        # winner off the table and then hunt for its number in a separate list.
+        local tid; tid="$(type_index "$t")"
         n=$(awk -v a="$v" -v m="$max" 'BEGIN{ if (m<=0) {print 0; exit} k=int(14*a/m+0.5); if (k<1 && a>0) k=1; print k }')
         bar="$(_bar "$n")$(printf '%*s' $((14-n)) '')"
         bc="$C_BCYN"; lcol="$C_WHITE"; mark=" "; note=""
@@ -2311,8 +2331,8 @@ bench_table() {
         dnum="$dl"; [[ "$dl" == *bits/sec* ]] && dnum="${dl%% *}$(printf '%s' "${dl#* }" | cut -c1)"
         unum="$ul"; [[ "$ul" == *bits/sec* ]] && unum="${ul%% *}$(printf '%s' "${ul#* }" | cut -c1)"
         ucol="$lcol"; [[ "$ul" == FAIL || "$ul" == n/a ]] && ucol="$C_BYEL"
-        printf '  %b%s%b %b%-11s%b %b%s%b %b%-7s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
-            "$C_BGRN" "$mark" "$C_RESET" "$lcol" "$t" "$C_RESET" \
+        printf '  %b%s%b%b%2s)%b %b%-11s%b %b%s%b %b%-7s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
+            "$C_BGRN" "$mark" "$C_RESET" "$C_BCYN" "$tid" "$C_RESET" "$lcol" "$t" "$C_RESET" \
             "$bc" "$bar" "$C_RESET" "$lcol" "$dnum" "$C_RESET" \
             "$ucol" "$unum" "$C_RESET" \
             "$lsc" "$ls" "$C_RESET" "$pg" "$C_GREY" "$note" "$C_RESET"
