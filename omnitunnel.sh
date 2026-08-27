@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.11.3"
+VERSION="2.12.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -371,7 +371,7 @@ kernel_up_cmd() {
                     encap=" encap gue encap-sport $PORT encap-dport $PORT";;
         gretap-fou) mods="$foumod"; pre="$fou_bind"; encap="$fou_encap"; link="gretap";;
         vxlan)
-            echo "modprobe vxlan 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type vxlan id $PORT local $LOCAL_IP remote $PEER_IP dstport $PORT ttl 255; ip addr add $TUN_ADDR/24 dev $DEV; ip link set $DEV up mtu $MTU"
+            echo "modprobe vxlan 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type vxlan id $PORT local $LOCAL_IP remote $PEER_IP dstport $PORT ttl 255 && ip addr replace $TUN_ADDR/24 dev $DEV && ip link set $DEV up mtu $MTU"
             return;;
         geneve)
             # GENEVE takes NO `local` - iproute2 rejects it outright, so the outer
@@ -380,11 +380,17 @@ kernel_up_cmd() {
             # Like vxlan the device is Ethernet (link/ether, ARP on), so it takes
             # a /24 rather than a peer address. PORT doubles as the VNI and the
             # UDP dstport, same as vxlan.
-            echo "modprobe geneve 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type geneve id $PORT remote $PEER_IP dstport $PORT ttl 255; ip addr add $TUN_ADDR/24 dev $DEV; ip link set $DEV up mtu $MTU"
+            echo "modprobe geneve 2>/dev/null; ip link del $DEV 2>/dev/null; ip link add $DEV type geneve id $PORT remote $PEER_IP dstport $PORT ttl 255 && ip addr replace $TUN_ADDR/24 dev $DEV && ip link set $DEV up mtu $MTU"
             return;;
         *) return;;
     esac
-    echo "$mods; ip link del $DEV 2>/dev/null;${pre:+ $pre;} ip link add $DEV type $link local $LOCAL_IP remote $PEER_IP ttl 255 $opts$encap; $(_kern_addr_cmd); ip link set $DEV up mtu $MTU"
+    # The setup steps are &&-chained on purpose. They used to be separated by
+    # ';', so only the LAST command decided the exit status: `ip link add` could
+    # fail outright and `ip link set up` would still succeed against a leftover
+    # device of the same name, the unit would report success, and systemd would
+    # never retry. A tunnel that never came up showed a green light.
+    # The prefix stays tolerant - modprobe and the delete are allowed to fail.
+    echo "$mods; ip link del $DEV 2>/dev/null;${pre:+ $pre;} ip link add $DEV type $link local $LOCAL_IP remote $PEER_IP ttl 255 $opts$encap && $(_kern_addr_cmd) && ip link set $DEV up mtu $MTU"
 }
 # Teardown. The fou/gue transports also hold a GLOBAL "UDP port -> decap" binding
 # that outlives the device, and it is not cosmetic: the port stays occupied, so a
@@ -698,7 +704,21 @@ RemainAfterExit=yes
 ExecStart=$SCRIPT_PATH _wgup $1
 ExecStartPost=$SCRIPT_PATH _postup $1
 ExecStop=-$SCRIPT_PATH _wgdown $1
-Restart=no
+# A kernel carrier used to get exactly ONE attempt at boot: Type=oneshot with
+# Restart=no, so any transient failure was permanent and the tunnel stayed down
+# until someone restarted it by hand. Meanwhile udp/tcp/mux/ws run Restart=always
+# and quietly recover - which is why a reboot drops SOME tunnels and not others.
+#
+# network-online.target is not a dependable gate: on a stock Ubuntu VPS
+# systemd-networkd-wait-online is often disabled, so the target is reached
+# before the address is actually usable and nothing waits for it.
+#
+# StartLimitIntervalSec=0 matters as much as the retry: without it systemd gives
+# up permanently after 5 attempts in 10s, which is exactly what a slow network
+# would trigger.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -719,7 +739,11 @@ RemainAfterExit=yes
 ExecStart=/bin/sh -c '$(kernel_up_cmd)'
 ExecStartPost=$SCRIPT_PATH _postup $1
 ExecStop=-/bin/sh -c '$(kernel_down_cmd)'
-Restart=no
+# See the wireguard unit above: one shot at boot with no retry is why a reboot
+# drops kernel carriers while the userspace ones come back on their own.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -784,8 +808,78 @@ inst_enable() {
     [[ "${OMNITUN_NO_BOOT:-0}" == 1 ]] || sleep 2
     inst_status "$1" || true
     restart_pf_relays "$1"   # drop stale relay connections to the old tunnel
+    # A boot-persistent instance gets the watchdog; throwaway ones do not.
+    [[ "${OMNITUN_NO_BOOT:-0}" == 1 ]] || watchdog_install
 }
 inst_running() { systemctl is-active "$(svc_name "$1")" >/dev/null 2>&1; }
+
+# `systemctl is-active` is not health. A kernel carrier is Type=oneshot with
+# RemainAfterExit=yes, so once its start has succeeded the unit reports active
+# for ever - including after its device has been deleted, the module unloaded,
+# or the interface torn down by something else. Restart=on-failure cannot help
+# there because nothing "failed"; the unit simply is not watching any more.
+#
+# This is why a reboot appears to drop SOME tunnels: udp/tcp/mux/ws run
+# Restart=always and come back on their own, while a kernel carrier that lost
+# its device sits there showing green with no traffic passing.
+#
+# Health = the device actually exists and is up. hysteria owns no device, so for
+# that one the unit state IS the answer.
+inst_healthy() {
+    local n="$1"; load_inst "$n"
+    inst_running "$n" || return 1
+    type_is_hysteria "$TYPE" && return 0
+    [[ -n "${DEV:-}" ]] || return 0
+    ip link show "$DEV" >/dev/null 2>&1 || return 1
+    ip -o link show "$DEV" 2>/dev/null | grep -q 'state DOWN' && return 1
+    return 0
+}
+
+# Re-assert every enabled instance whose device has gone missing. Safe to run on
+# a timer: a healthy tunnel is left completely alone.
+cmd_watchdog() {
+    need_root
+    local n fixed=0 checked=0
+    for n in $(list_instances); do
+        inst_exists "$n" || continue
+        systemctl is-enabled "$(svc_name "$n")" >/dev/null 2>&1 || continue
+        checked=$((checked+1))
+        if ! inst_healthy "$n"; then
+            logger -t omnitunnel "watchdog: '$n' is enabled but not healthy - restarting" 2>/dev/null || true
+            systemctl restart "$(svc_name "$n")" >/dev/null 2>&1 || true
+            fixed=$((fixed+1))
+        fi
+    done
+    [[ "${1:-}" == -q ]] || echo "watchdog: checked $checked, restarted $fixed"
+}
+
+# A timer, not a daemon: nothing to supervise, and it survives its own crash.
+watchdog_install() {
+    need_root
+    cat > /etc/systemd/system/omnitunnel-watchdog.service <<UNIT
+[Unit]
+Description=OmniTunnel watchdog - restart tunnels whose device has gone away
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_PATH _watchdog -q
+UNIT
+    cat > /etc/systemd/system/omnitunnel-watchdog.timer <<UNIT
+[Unit]
+Description=Run the OmniTunnel watchdog every minute
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable --now omnitunnel-watchdog.timer >/dev/null 2>&1 || true
+}
 inst_header() {
     printf '  %b    %-12s%-12s%-25s%-8s%-5s%b\n' \
         "$C_BCYN" "NAME" "TYPE" "PEER" "RTT" "LOSS" "$C_RESET"
@@ -2345,6 +2439,8 @@ case "${1:-menu}" in
     mux-off)          need_root; cmd_mux_off "${2:?instance}";;
     _postup)          cmd_postup "${2:?}";;
     _wgup)            need_root; cmd_wgup "${2:?instance}";;
+    _watchdog)        need_root; cmd_watchdog "${2:-}";;
+    watchdog)         need_root; cmd_watchdog;;
     _wgdown)          need_root; cmd_wgdown "${2:?instance}";;
     _peercreate)      shift; cmd_peercreate "$@";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
