@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.12.3"
+VERSION="2.12.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1645,12 +1645,34 @@ BENCH_OMIT="${OMNITUN_BENCH_OMIT:-2}"
 # few minutes earlier on a link that has since improved; anything past that is
 # not a slow tunnel, it is a wrong number, and reporting nothing beats reporting
 # a fake winner. Skipped entirely when the raw path could not be measured.
+# Reject a figure the measurement could not physically have produced - meaning
+# iperf3 never went through the tunnel at all. The case this exists for is a
+# stray listener on the loopback relay port: the run then measures loopback and
+# reports something like 8.13 Gbit/s on a 162 Mbit path, and because it is the
+# largest number it sorts to the top and wins the table.
+#
+# The ceiling is deliberately loose, and the first version got that badly wrong.
+# It used 1.5x of the raw figure for that ONE direction, which assumed the raw
+# measurement is always sound. It is not: on a run where the raw download came
+# back at 74 Mbit/s for a path that does 1.78 Gbit/s, the ceiling landed at
+# 111 Mbit and every honest download above it - 200 to 500 Mbit - was thrown
+# away as "impossible", while the uploads, whose raw figure happened to be
+# fine, all came through. A whole column of FAIL caused entirely by one bad
+# baseline reading.
+#
+# So: take the BETTER of the two raw figures, so one bad direction cannot poison
+# both, and allow 10x. That still catches the loopback case (50x) with room to
+# spare, while leaving genuine results alone. A number this rejects is a broken
+# measurement, not a slow tunnel, so the caller reports why rather than FAIL.
 bench_sane() {
-    local v="$1" raw="$2"
+    local v="$1" raw="$2" raw_other="${3:-}"
     [[ -z "$v" ]] && { printf ""; return 1; }
-    local rm_; rm_="$(_mbit "$raw")"
-    awk -v r="$rm_" 'BEGIN{ exit !(r > 0.05) }' || { printf "%s" "$v"; return 0; }
-    if awk -v a="$(_mbit "$v")" -v r="$rm_" 'BEGIN{ exit !(a > r*1.5) }'; then
+    local a r1 r2 base
+    a="$(_mbit "$v")"; r1="$(_mbit "$raw")"; r2="$(_mbit "$raw_other")"
+    base="$(awk -v x="$r1" -v y="$r2" 'BEGIN{ print (x>y)?x:y }')"
+    # no usable baseline - nothing to compare against, so accept
+    awk -v r="$base" 'BEGIN{ exit !(r > 0.05) }' || { printf "%s" "$v"; return 0; }
+    if awk -v a="$a" -v r="$base" 'BEGIN{ exit !(a > r*10) }'; then
         printf ""; return 1
     fi
     printf "%s" "$v"; return 0
@@ -1926,8 +1948,8 @@ bench_run() {
             hrtt=$(ping -c3 -W2 "$fhost" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
             hdl=$(bench_curl_mbps "http://127.0.0.1:5598/omnibench.bin")
             hul=$(_iperf_rx 75 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8)
-            hdl=$(bench_sane "$hdl" "$raw_dl") || hdl=""
-            hul=$(bench_sane "$hul" "$raw_ul") || hul=""
+            hdl=$(bench_sane "$hdl" "$raw_dl" "$raw_ul") || hdl=""
+            hul=$(bench_sane "$hul" "$raw_ul" "$raw_dl") || hul=""
             rows+=("$t|${hdl:-FAIL}|${hul:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL} / up ${hul:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
@@ -1953,8 +1975,8 @@ bench_run() {
             local rdl rul
             rdl=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8 -R)
             rul=$(_iperf_rx 75 -c 127.0.0.1 -p "$bport" -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
-            rdl=$(bench_sane "$rdl" "$raw_dl") || rdl=""
-            rul=$(bench_sane "$rul" "$raw_ul") || rul=""
+            rdl=$(bench_sane "$rdl" "$raw_dl" "$raw_ul") || rdl=""
+            rul=$(bench_sane "$rul" "$raw_ul" "$raw_dl") || rul=""
             rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
             echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
             inst_remove "$name" >/dev/null 2>&1
@@ -1988,8 +2010,8 @@ bench_run() {
             ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
             [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
         fi
-        dl=$(bench_sane "$dl" "$raw_dl") || dl=""
-        ul=$(bench_sane "$ul" "$raw_ul") || ul=""
+        dl=$(bench_sane "$dl" "$raw_dl" "$raw_ul") || dl=""
+        ul=$(bench_sane "$ul" "$raw_ul" "$raw_dl") || ul=""
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
         echo "${dl:-FAIL} / up ${ul:-FAIL}${ulwhy}"
         inst_remove "$name" >/dev/null 2>&1
