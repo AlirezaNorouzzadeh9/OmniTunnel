@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.12.4"
+VERSION="2.12.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -903,7 +903,7 @@ inst_status() {
         elif ip link show "$DEV" >/dev/null 2>&1; then target="$PEER_ADDR"; fi
         if [[ -n "$target" ]]; then
             local out l r rn; out=$(ping -c2 -W2 "$target" 2>/dev/null || true)
-            l=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+' || true)
+            l=$(echo "$out" | grep -oE '[0-9]+(.[0-9]+)?% packet loss' | grep -oE '^[0-9]+' || true)
             r=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}' || true)
             if [[ -n "$r" ]]; then
                 rn=$(awk -v x="$r" 'BEGIN{printf "%.0f", x}')
@@ -1695,7 +1695,13 @@ _iperf_rx() {
         fi
         v="$(printf '%s\n' "$out" | grep -oE '[0-9.]+ [KMGT]?bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')"
         if [[ -n "$v" ]]; then printf '%s' "$v"; return 0; fi
-        if printf '%s' "$out" | grep -q 'busy running a test'; then
+        # Transient server-side states, not a broken tunnel: the server is still
+        # finishing the previous test, or it reset the control connection because
+        # it had not finished cleaning up after a fast one. Observed on a link
+        # where every transport that downloaded above ~250 Mbit/s then failed its
+        # upload with "control message: Connection reset by peer", while the
+        # slower ones succeeded.
+        if printf '%s' "$out" | grep -qE 'busy running a test|Connection reset by peer|control message'; then
             why="server busy"; printf '%s' "$why" > "$_BENCH_WHY_F"; sleep 3; continue
         fi
         why="$(printf '%s\n' "$out" | grep -m1 -oE 'error - .*' | sed 's/^error - //')"
@@ -1967,7 +1973,7 @@ bench_run() {
             local rout rloss rrtt
             rout=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
             rrtt=$(echo "$rout" | awk -F'/' '/rtt|round-trip/{print $5}')
-            rloss=$(echo "$rout" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+            rloss=$(echo "$rout" | grep -oE '[0-9]+(.[0-9]+)?% packet loss' | grep -oE '^[0-9]+')
             echo "$bport:127.0.0.1:5599" > "$(mux_conf "$name")"
             mux_relay_reconcile "$name" >/dev/null 2>&1
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $(mux_token "$name")" >/dev/null 2>&1
@@ -1989,7 +1995,7 @@ bench_run() {
         local out loss rtt dl
         out=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
-        loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+        loss=$(echo "$out" | grep -oE '[0-9]+(.[0-9]+)?% packet loss' | grep -oE '^[0-9]+')
         dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8 -R)
         # if iperf couldn't measure but the tunnel is actually up (loss < 100),
         # fall back to a curl download through the tun to the foreign's file server
@@ -2006,7 +2012,9 @@ bench_run() {
             # traffic at all, so don't spend another 75s proving it twice.
             ulwhy=" (tunnel down)"
         else
-            sleep 2
+            # 2s was not enough after a fast download - the server was still tearing
+            # the previous test down and reset the upload's control connection.
+            sleep 5
             ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
             [[ -z "$ul" ]] && ulwhy=" ($(_bench_why))"
         fi
@@ -2103,7 +2111,7 @@ cmd_bench_manual() {
         local out loss rtt dl ul
         out=$(ping -c3 -W2 "$pa" 2>/dev/null || true)
         rtt=$(echo "$out" | awk -F'/' '/rtt|round-trip/{print $5}')
-        loss=$(echo "$out" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
+        loss=$(echo "$out" | grep -oE '[0-9]+(.[0-9]+)?% packet loss' | grep -oE '^[0-9]+')
         dl=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8 -R)
         ul=$(_iperf_rx 75 -c "$pa" -p 5599 -t "$BENCH_SECS" -O "$BENCH_OMIT" -P 8)
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}"); echo "${dl:-FAIL} / up ${ul:-FAIL}"
