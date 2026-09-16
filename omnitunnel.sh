@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.12.5"
+VERSION="2.12.6"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -989,7 +989,14 @@ pf_del() {
     if [[ -f "$pf" ]]; then
         for p in ${ports//,/ }; do
             [[ "$p" =~ ^[0-9]+$ ]] || continue
-            grep -v ":$p\$" "$pf" > "$pf.t" 2>/dev/null && mv "$pf.t" "$pf" || rm -f "$pf.t"
+            # grep exits 1 when it selects NOTHING, which is exactly what happens
+            # when the port being removed is the last one left. The old form was
+            # `grep ... && mv ... || rm`, so that exit status skipped the mv and
+            # threw the result away, leaving pf.conf untouched while still
+            # printing "removed". Deleting the only forward silently did nothing.
+            # Brace-group the grep so its exit status cannot veto the move - the
+            # same idiom cmd_mux_del already used.
+            { grep -v ":$p\$" "$pf" 2>/dev/null || true; } > "$pf.t" && mv "$pf.t" "$pf"
         done
     fi
     pf_apply_all "$1"; ok "removed forward(s) on port(s) $ports from '$1'"
