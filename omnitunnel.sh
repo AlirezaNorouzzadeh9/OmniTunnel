@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.12.6"
+VERSION="2.13.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -641,14 +641,46 @@ hy_pf_reconcile() {
 }
 
 # ------------------------------------------------------------- tuning ---------
+# `sysctl -w` only lasts until the next reboot. ip_forward in particular is OFF by
+# default on Ubuntu, so without a drop-in every port forward on the box silently
+# stops working after a restart - the tunnel still pings, but nothing routes.
+SYSCTL_DROPIN=/etc/sysctl.d/99-omnitunnel.conf
+persist_sysctl() {
+    [[ -d /etc/sysctl.d ]] || return 0
+    cat > "$SYSCTL_DROPIN" <<'SYSCTL' 2>/dev/null || return 0
+# Written by OmniTunnel. Required for DNAT/port forwards to survive a reboot.
+net.ipv4.ip_forward = 1
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+SYSCTL
+    return 0
+}
+
+# Docker sets the FORWARD policy to DROP and owns that chain, so on any box that has
+# ever run Docker our forwarded traffic is dropped even though the tunnel is healthy.
+# DOCKER-USER is the one chain Docker promises never to rewrite, which makes it the
+# right place to whitelist the tunnel device. A no-op where Docker is not installed.
+allow_forward_dev() {
+    local dev="$1" d
+    iptables -S DOCKER-USER >/dev/null 2>&1 || return 0
+    for d in -i -o; do
+        iptables -C DOCKER-USER "$d" "$dev" -j ACCEPT 2>/dev/null || \
+            iptables -I DOCKER-USER 1 "$d" "$dev" -j ACCEPT 2>/dev/null || true
+    done
+    return 0
+}
 apply_tuning() {
     local dev="$1" shape="${2:-none}"
+    persist_sysctl
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     sysctl -w net.core.rmem_max=67108864 >/dev/null 2>&1 || true
     sysctl -w net.core.wmem_max=67108864 >/dev/null 2>&1 || true
     sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
     modprobe tcp_bbr 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+    allow_forward_dev "$dev"
     local i; for i in $(seq 1 40); do ip link show "$dev" >/dev/null 2>&1 && break; sleep 0.25; done
     ip link set "$dev" txqueuelen 1000 2>/dev/null || true
     if [[ "$shape" != none && -n "$shape" ]]; then
@@ -697,6 +729,9 @@ EOF
 Description=OmniTunnel wireguard instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
 After=network-online.target
 Wants=network-online.target
+# systemd only honours this in [Unit]; in [Service] it is parsed as an unknown
+# key and silently ignored, which leaves the default 5-in-10s limit in force.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -718,7 +753,6 @@ ExecStop=-$SCRIPT_PATH _wgdown $1
 # would trigger.
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -732,6 +766,8 @@ EOF
 Description=OmniTunnel $TYPE instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
 After=network-online.target
 Wants=network-online.target
+# See the wireguard unit: this key is only honoured in [Unit].
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -743,7 +779,6 @@ ExecStop=-/bin/sh -c '$(kernel_down_cmd)'
 # drops kernel carriers while the userspace ones come back on their own.
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
